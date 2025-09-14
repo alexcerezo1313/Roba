@@ -8,18 +8,17 @@ import io, uuid, time
 st.set_page_config(page_title="Armario Digital (Cloud)", page_icon="🧥", layout="wide")
 
 # =============================================================================
-# Supabase: conexión + secrets NORMALIZADOS (parche anti "[Errno -2]")
+# Supabase: conexión + secrets normalizados
 # =============================================================================
 raw_url = str(st.secrets.get("SUPABASE_URL", "")).strip()
 raw_key = str(st.secrets.get("SUPABASE_ANON_KEY", "")).strip()
 raw_bucket = str(st.secrets.get("SUPABASE_BUCKET", "wardrobe-photos")).strip()
+APP_URL = str(st.secrets.get("APP_URL", "")).strip()
 
-# Auto-arreglos típicos
 if raw_url and not raw_url.startswith("http"):
     raw_url = "https://" + raw_url
 raw_url = raw_url.rstrip("/")
 
-# Validaciones mínimas
 if not raw_url or ".supabase.co" not in raw_url:
     st.error("SUPABASE_URL no es válido. Debe parecerse a: https://xxxxx.supabase.co")
     st.stop()
@@ -29,7 +28,7 @@ if not raw_key:
 
 SUPABASE_URL = raw_url
 SUPABASE_ANON_KEY = raw_key
-SUPABASE_BUCKET = raw_bucket
+SUPABASE_BUCKET = raw_bucket or "wardrobe-photos"
 
 sb: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
@@ -167,7 +166,7 @@ def colors_compatible(a,b):
     return (fb in COMPAT.get(fa,[])) or (fa in COMPAT.get(fb,[]))
 
 # =============================================================================
-# Autenticación (sidebar) + sesión robusta
+# Sidebar: login / signup
 # =============================================================================
 with st.sidebar:
     st.header("🔑 Cuenta")
@@ -187,8 +186,13 @@ with st.sidebar:
     else:
         if cA.button("Registrarme"):
             try:
-                sb.auth.sign_up({"email": email, "password": password})
-                st.success("Registro correcto. Revisa tu correo si pide verificación.")
+                redirect_to = APP_URL or SUPABASE_URL
+                sb.auth.sign_up({
+                    "email": email,
+                    "password": password,
+                    "options": {"email_redirect_to": redirect_to}
+                })
+                st.success("Registro correcto. Revisa tu correo y pulsa el enlace de verificación.")
             except Exception as e:
                 st.error(f"Error: {e}")
 
@@ -228,26 +232,94 @@ def signed_url(path: str, expires_sec: int = 3600) -> str:
     return res.get("signedURL") or res.get("signed_url") or ""
 
 # =============================================================================
-# DB helpers
+# DB helpers (a prueba de tabla inexistente)
 # =============================================================================
-def db_items_fetch():
-    res = sb.table("items").select("*").eq("user_id", user.id).order("created_at").execute()
-    return pd.DataFrame(res.data or [])
+CREATE_SQL = """
+-- Ejecuta esto en Supabase → SQL Editor si no tienes las tablas
 
-def db_item_insert(d): sb.table("items").insert({"user_id": user.id, **d}).execute()
-def db_item_update(item_id, d): sb.table("items").update(d).eq("id", item_id).eq("user_id", user.id).execute()
-def db_item_delete(item_id): sb.table("items").delete().eq("id", item_id).eq("user_id", user.id).execute()
+create table if not exists public.items (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  created_at timestamp with time zone default now(),
+  nombre text not null,
+  categoria text not null,
+  tipo text not null,
+  estilo text not null,
+  color1_hex text,
+  color1_name text,
+  color2_hex text,
+  color2_name text,
+  photo_path text
+);
 
-def db_outfits_fetch():
-    res = sb.table("outfits").select("*").eq("user_id", user.id).order("created_at").execute()
-    return pd.DataFrame(res.data or [])
+create table if not exists public.outfits (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  created_at timestamp with time zone default now(),
+  name text not null,
+  temp_min integer,
+  temp_max integer,
+  seasons jsonb default '[]'::jsonb,
+  elegance integer,
+  item_ids jsonb default '[]'::jsonb
+);
 
-def db_outfit_insert(d): sb.table("outfits").insert({"user_id": user.id, **d}).execute()
-def db_outfit_update(outfit_id, d): sb.table("outfits").update(d).eq("id", outfit_id).eq("user_id", user.id).execute()
-def db_outfit_delete(outfit_id): sb.table("outfits").delete().eq("id", outfit_id).eq("user_id", user.id).execute()
+alter table public.items   enable row level security;
+alter table public.outfits enable row level security;
+
+do $$
+begin
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='items' and policyname='items_select_own') then
+    create policy items_select_own on public.items for select using (auth.uid() = user_id);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='items' and policyname='items_modify_own') then
+    create policy items_modify_own on public.items for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  end if;
+
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='outfits' and policyname='outfits_select_own') then
+    create policy outfits_select_own on public.outfits for select using (auth.uid() = user_id);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='outfits' and policyname='outfits_modify_own') then
+    create policy outfits_modify_own on public.outfits for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+  end if;
+end$$;
+"""
+
+def _safe_select(table: str):
+    """Devuelve DataFrame o None y muestra instrucciones si falta la tabla/RLS."""
+    try:
+        res = sb.table(table).select("*").eq("user_id", user.id).order("created_at").execute()
+        return pd.DataFrame(res.data or [])
+    except Exception as e:
+        msg = str(e)
+        st.error(f"⚠️ No pude leer la tabla **{table}**. Probablemente no existe o falta RLS.")
+        with st.expander("Ver SQL para crear tablas y políticas (copiar/pegar en Supabase → SQL Editor)"):
+            st.code(CREATE_SQL, language="sql")
+        st.stop()
+
+def db_items_fetch():   return _safe_select("items")
+def db_outfits_fetch(): return _safe_select("outfits")
+
+def db_item_insert(d):
+    sb.table("items").insert({"user_id": user.id, **d}).execute()
+
+def db_item_update(item_id, d):
+    sb.table("items").update(d).eq("id", item_id).eq("user_id", user.id).execute()
+
+def db_item_delete(item_id):
+    sb.table("items").delete().eq("id", item_id).eq("user_id", user.id).execute()
+
+def db_outfit_insert(d):
+    sb.table("outfits").insert({"user_id": user.id, **d}).execute()
+
+def db_outfit_update(outfit_id, d):
+    sb.table("outfits").update(d).eq("id", outfit_id).eq("user_id", user.id).execute()
+
+def db_outfit_delete(outfit_id):
+    sb.table("outfits").delete().eq("id", outfit_id).eq("user_id", user.id).execute()
 
 # =============================================================================
-# Añadir prenda (3 métodos color, auto con 2 fases)
+# UI: añadir prenda
 # =============================================================================
 st.title("👕 Armario Digital (Cloud)")
 
