@@ -5,13 +5,13 @@ from datetime import datetime
 import base64, io
 from PIL import Image
 import numpy as np
-import plotly.express as px
+from streamlit_cropper import st_cropper
 
 st.set_page_config(page_title="👕 Armario Digital", page_icon="🧥", layout="wide")
 
 # ---------- Config ----------
 COLUMNS = ["Categoria", "Tipo", "Color1Nombre", "Color1Hex", "Color2Nombre", "Color2Hex", "FotoBase64"]
-SCHEMA_VERSION = "7.0"
+SCHEMA_VERSION = "8.0"
 
 CATEGORIAS = [
     "Camiseta", "Camisa", "Sudadera",
@@ -54,6 +54,14 @@ def hex_from_rgb(rgb_tuple) -> str:
     r, g, b = rgb_tuple[:3]
     return f"#{r:02X}{g:02X}{b:02X}"
 
+def color_preview(hex_code: str):
+    if not hex_code:
+        return
+    st.markdown(
+        f"<div style='background:{hex_code};width:100%;height:26px;border:1px solid #000;border-radius:6px;'></div>",
+        unsafe_allow_html=True
+    )
+
 def df_to_xml_bytes(df: pd.DataFrame) -> bytes:
     root = Element("wardrobe", attrib={"version": SCHEMA_VERSION})
     for _, row in df.iterrows():
@@ -90,31 +98,51 @@ def xml_bytes_to_df(xml_bytes: bytes) -> pd.DataFrame:
         st.error(f"XML no válido: {e}")
         return pd.DataFrame(columns=COLUMNS)
 
-def color_preview(hex_code: str):
-    if not hex_code:
-        return
-    st.markdown(
-        f"<div style='background:{hex_code};width:100%;height:26px;border:1px solid #000;border-radius:6px;'></div>",
-        unsafe_allow_html=True
-    )
+def dominant_or_mean_color(img: Image.Image, mode: str = "mean") -> str:
+    """
+    Extrae color de un recorte:
+    - mode='mean': color medio del recorte (más estable)
+    - mode='dominant': color dominante (cuantización simple)
+    """
+    arr = np.array(img.convert("RGB"))
+    if arr.size == 0:
+        return ""
+    if mode == "mean":
+        r, g, b = arr.reshape(-1, 3).mean(axis=0)
+        return hex_from_rgb((int(r), int(g), int(b)))
+    else:
+        # dominante por cuantización
+        small = Image.fromarray(arr).resize((64, 64))
+        q = small.quantize(colors=4, method=Image.MEDIANCUT)
+        pal = q.getpalette()[:12]
+        counts = q.getcolors() or []
+        if not counts:
+            return ""
+        counts.sort(reverse=True, key=lambda t: t[0])
+        _, idx = counts[0]
+        r, g, b = pal[idx*3: idx*3+3]
+        return hex_from_rgb((r, g, b))
 
-def pick_color_from_plotly(img: Image.Image, label: str) -> str:
-    """Muestra la imagen con Plotly y permite seleccionar un píxel con el cursor."""
-    arr = np.array(img)
-    fig = px.imshow(arr)
-    fig.update_layout(
-        dragmode="drawclosedpath",  # permite marcar zonas
-        margin=dict(l=0, r=0, t=0, b=0),
-    )
-    st.caption(f"{label} — Haz clic en la imagen (usa la herramienta de selección para marcar un píxel).")
-    st.plotly_chart(fig, use_container_width=True)
-    st.info("⚠️ Nota: Streamlit aún no devuelve la coordenada exacta del clic en Plotly.\n"
-            "Si quieres que te dé el color exacto del píxel, necesitamos un paso adicional con un callback de Plotly.")
-    return ""  # de momento placeholder
+def detectar_color_secundario(img: Image.Image, n_colors: int = 3, min_dist: int = 24) -> tuple[str, bool]:
+    thumb = img.copy()
+    thumb.thumbnail((256, 256))
+    q = thumb.convert("RGB").quantize(colors=n_colors, method=Image.MEDIANCUT)
+    pal = q.getpalette()[:n_colors * 3]
+    counts = q.getcolors() or []
+    if not counts:
+        return "", False
+    counts.sort(reverse=True, key=lambda t: t[0])
+    _, idx0 = counts[0]
+    r0, g0, b0 = pal[idx0 * 3: idx0 * 3 + 3]
+    for _, idx in counts[1:]:
+        r, g, b = pal[idx * 3: idx * 3 + 3]
+        if abs(r - r0) + abs(g - g0) + abs(b - b0) >= min_dist:
+            return hex_from_rgb((r, g, b)), True
+    return "", False
 
 # ---------- UI ----------
 st.title("👕 Armario Digital")
-st.caption("Elige colores: paleta, picker exacto o clic sobre la imagen (Plotly). Añade color secundario y detecta si lo hay.")
+st.caption("Elige color por paleta, picker o **recortando una zona** de la imagen (el recorte hace de 'nueva foto' de un solo color).")
 
 with st.form("nueva_prenda", clear_on_submit=False):
     c1, c2 = st.columns([1, 1])
@@ -124,34 +152,40 @@ with st.form("nueva_prenda", clear_on_submit=False):
         tipo = st.selectbox("Tipo (corto/largo)", TIPOS)
 
         # --------- COLOR PRINCIPAL ----------
-        metodo1 = st.radio("Color principal — método", ["Paleta", "Picker", "Desde imagen (clic)"])
+        metodo1 = st.radio("Color principal — método", ["Paleta", "Picker", "Desde imagen (recorte)"])
         color1_name, color1_hex = "", ""
 
         if metodo1 == "Paleta":
             color1_name = st.selectbox("Color (paleta)", list(PALETA.keys()), key="c1pal")
             color1_hex = PALETA[color1_name]
             color_preview(color1_hex)
+
         elif metodo1 == "Picker":
             color1_hex = st.color_picker("Color exacto", "#cccccc", key="c1pick")
             color1_name = "Personalizado"
             color_preview(color1_hex)
+
         else:
-            foto1 = st.file_uploader("Fotografía para color principal (clic con Plotly)", type=["png", "jpg", "jpeg"], key="foto1")
+            foto1 = st.file_uploader("Fotografía para color principal (recórtala)", type=["png", "jpg", "jpeg"], key="foto1")
             if foto1:
                 img1 = Image.open(io.BytesIO(foto1.getvalue()))
-                color1_hex = pick_color_from_plotly(img1, "Color principal")
-                color1_name = "Desde imagen"
-                if color1_hex:
-                    color_preview(color1_hex)
+                st.write("Arrastra el rectángulo sobre la zona cuyo color quieras capturar.")
+                cropped1 = st_cropper(img1, aspect_ratio=None, return_type="image", box_color="#00FF00", realtime_update=True, key="crop1")
+                # Puedes elegir entre media o dominante del recorte:
+                modo_color1 = st.radio("Cómo extraer el color del recorte", ["Media del recorte", "Dominante"], horizontal=True, key="c1mode")
+                color1_hex = dominant_or_mean_color(cropped1, mode="mean" if modo_color1 == "Media del recorte" else "dominant")
+                color1_name = "Desde recorte"
+                color_preview(color1_hex)
+                st.caption("El recorte actúa como 'nueva imagen' de la que extraemos el color.")
             else:
-                st.info("Sube una foto para seleccionar el color con clic.")
+                st.info("Sube una foto para recortarla y extraer el color.")
 
         # --------- COLOR SECUNDARIO ----------
         st.markdown("---")
         usar_color2 = st.checkbox("Añadir color secundario (opcional)")
         color2_name, color2_hex, metodo2 = "", "", None
         if usar_color2:
-            metodo2 = st.radio("Color secundario — método", ["Paleta", "Picker", "Desde imagen (clic)"], key="m2")
+            metodo2 = st.radio("Color secundario — método", ["Paleta", "Picker", "Desde imagen (recorte)"], key="m2")
             if metodo2 == "Paleta":
                 color2_name = st.selectbox("Color secundario (paleta)", list(PALETA.keys()), key="c2pal")
                 color2_hex = PALETA[color2_name]
@@ -161,15 +195,33 @@ with st.form("nueva_prenda", clear_on_submit=False):
                 color2_name = "Personalizado"
                 color_preview(color2_hex)
             else:
-                foto2 = st.file_uploader("Fotografía para secundario", type=["png", "jpg", "jpeg"], key="foto2")
+                foto2 = st.file_uploader("Fotografía para color secundario (recórtala)", type=["png", "jpg", "jpeg"], key="foto2")
                 if foto2:
                     img2 = Image.open(io.BytesIO(foto2.getvalue()))
-                    color2_hex = pick_color_from_plotly(img2, "Color secundario")
-                    color2_name = "Desde imagen"
-                    if color2_hex:
-                        color_preview(color2_hex)
+                    st.write("Arrastra el rectángulo sobre la zona del color secundario.")
+                    cropped2 = st_cropper(img2, aspect_ratio=None, return_type="image", box_color="#00FF00", realtime_update=True, key="crop2")
+                    modo_color2 = st.radio("Cómo extraer el color del recorte", ["Media del recorte", "Dominante"], horizontal=True, key="c2mode")
+                    color2_hex = dominant_or_mean_color(cropped2, mode="mean" if modo_color2 == "Media del recorte" else "dominant")
+                    color2_name = "Desde recorte"
+                    color_preview(color2_hex)
                 else:
-                    st.info("Sube una foto para el color secundario.")
+                    st.info("Sube una foto para recortarla y extraer el color secundario.")
+
+        # --------- Botón: ¿Hay color secundario? ----------
+        st.markdown("---")
+        st.write("🔎 Detección automática de color secundario (opcional)")
+        foto_auto = st.file_uploader("Imagen para analizar", type=["png", "jpg", "jpeg"], key="foto_auto")
+        if st.button("¿Hay color secundario?"):
+            if not foto_auto:
+                st.warning("Sube una imagen para analizar.")
+            else:
+                img_auto = Image.open(io.BytesIO(foto_auto.getvalue()))
+                sugerido_hex, hay = detectar_color_secundario(img_auto)
+                if hay:
+                    st.success(f"Sí, parece haber un color secundario: **{sugerido_hex}**")
+                    color_preview(sugerido_hex)
+                else:
+                    st.info("No se detecta un color secundario claro.")
 
     with c2:
         foto_prenda = st.file_uploader("Fotografía de la prenda (opcional)", type=["png", "jpg", "jpeg"], key="fotoprenda")
@@ -243,4 +295,4 @@ else:
                 with cols[i % 6]:
                     st.image(img_bytes, caption=f"{row['Categoria']} ({row['Color1Hex'] or row['Color1Nombre']})", use_container_width=True)
 
-st.caption("💡 Consejo: guarda tu XML tras añadir prendas, y recárgalo cuando vuelvas a la web.")
+st.caption("💡 Consejo: recorta una zona con el color que quieras y se calculará el color medio o dominante del recorte.")
