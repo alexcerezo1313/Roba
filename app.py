@@ -6,19 +6,34 @@ import base64, io
 from PIL import Image
 import numpy as np
 
-st.set_page_config(page_title="👕 Armario Digital — Auto colores", page_icon="🧥", layout="wide")
+st.set_page_config(page_title="👕 Armario Digital — Colores por Paleta/Hex/Auto", page_icon="🧥", layout="wide")
 
 # ---------------- Config ----------------
 CATEGORIAS = ["Camiseta", "Camisa", "Sudadera", "Pantalón", "Short", "Falda", "Zapatillas", "Botas", "Sandalias"]
 TIPOS = ["Corto", "Largo"]
 COLUMNS = ["Categoria", "Tipo", "Color1Hex", "Color2Hex", "FotoBase64"]
-SCHEMA_VERSION = "10.1"
+SCHEMA_VERSION = "11.0"
+
+# Paleta sencilla de colores comunes en ropa (nombre -> hex)
+PALETA = {
+    "Negro": "#000000",
+    "Blanco": "#FFFFFF",
+    "Gris": "#808080",
+    "Beige": "#F5F5DC",
+    "Marrón": "#8B4513",
+    "Azul marino": "#000080",
+    "Azul claro": "#87CEEB",
+    "Rojo": "#FF0000",
+    "Verde": "#008000",
+    "Amarillo": "#FFFF00",
+    "Rosa": "#FFC0CB"
+}
 
 # Parámetros AUTOMÁTICOS optimizados para 1 prenda por foto
 AUTO_PARAMS = dict(
     center_keep=0.95,          # Mantener 95% central
     ignore_bg_mode="auto",     # Ignorar fondo claro/oscuro automáticamente
-    exclude_skin=False,        # No hace falta si la foto es solo la prenda
+    exclude_skin=False,        # Asumimos solo prenda
     exclude_border=True,       # Excluir color parecido a los bordes (fondo)
     sat_min=0.12,              # Saturación mínima
     val_min=0.12,              # Brillo mínimo
@@ -30,10 +45,11 @@ AUTO_PARAMS = dict(
     user_bg_hex=None           # Sin color de fondo explícito
 )
 
+# Estado
 if "armario" not in st.session_state:
     st.session_state["armario"] = pd.DataFrame(columns=COLUMNS)
 
-# ---------------- Utils básicos ----------------
+# ---------------- Utilidades ----------------
 def file_to_b64(uploaded_file) -> str:
     if uploaded_file is None:
         return ""
@@ -136,6 +152,15 @@ def estimate_border_colors(arr_rgb_uint8: np.ndarray, width: int, height: int, b
     L = [tuple(int(x) for x in top), tuple(int(x) for x in bottom), tuple(int(x) for x in left), tuple(int(x) for x in right)]
     return L
 
+@st.cache_data(show_spinner=False)
+def auto_colors_from_image_bytes(
+    image_bytes: bytes,
+    params: dict
+):
+    """Cachea por imagen+parámetros para no recalcular si no cambia nada."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return auto_colors_from_image(img, **params)
+
 def auto_colors_from_image(
     image: Image.Image,
     center_keep: float = AUTO_PARAMS["center_keep"],
@@ -152,17 +177,15 @@ def auto_colors_from_image(
     user_bg_hex: str | None = AUTO_PARAMS["user_bg_hex"]
 ):
     """
-    Devuelve (c1_hex, c2_hex, meta_dict) totalmente AUTOMÁTICO.
-    Pensado para 1 prenda centrada en la foto.
+    Devuelve (c1_hex, c2_hex, meta_dict) totalmente AUTOMÁTICO para 1 prenda.
     """
     # --- Preproceso y reducción ---
-    img = image.convert("RGB")
-    w0, h0 = img.size
+    w0, h0 = image.size
     scale = min(640 / max(w0, h0), 1.0)
     if scale < 1.0:
-        img = img.resize((int(w0*scale), int(h0*scale)), Image.LANCZOS)
-    w, h = img.size
-    arr = np.array(img)                  # (H, W, 3)
+        image = image.resize((int(w0*scale), int(h0*scale)), Image.LANCZOS)
+    w, h = image.size
+    arr = np.array(image)                  # (H, W, 3)
     flat = arr.reshape(-1, 3).astype(np.uint8)
 
     # --- Región central ---
@@ -183,7 +206,6 @@ def auto_colors_from_image(
 
     # --- Modo fondo ---
     if ignore_bg_mode == "auto":
-        # quitar blancos/grises muy claros y negro profundo
         mask &= ~((hsv2d[:, :, 2] > 0.92) & (hsv2d[:, :, 1] < 0.20))
         mask &= ~(hsv2d[:, :, 2] < 0.08)
     elif ignore_bg_mode == "claro":
@@ -191,7 +213,7 @@ def auto_colors_from_image(
     elif ignore_bg_mode == "oscuro":
         mask &= ~(hsv2d[:, :, 2] < 0.12)
 
-    # --- Excluir tono piel (por si hay mano sujetando) ---
+    # --- Excluir tono piel (probablemente no necesario) ---
     if exclude_skin:
         skin2d = skin_mask(flat).reshape(h, w)
         mask &= ~skin2d
@@ -209,7 +231,7 @@ def auto_colors_from_image(
             dist = dh * 0.6 + ds * 0.8 + dv * 0.4
             mask &= (dist.reshape(h, w) > border_sim_thresh)
 
-    # --- Excluir color de fondo proporcionado (aquí None por defecto) ---
+    # --- Excluir color de fondo proporcionado (no usado por defecto) ---
     if user_bg_hex:
         bg = tuple(int(user_bg_hex[i:i+2], 16) for i in (1, 3, 5))
         hsv_bg = rgb_to_hsv_vec(np.array([bg], dtype=np.uint8))[0]
@@ -220,7 +242,7 @@ def auto_colors_from_image(
         mask &= (dist.reshape(h, w) > 0.14)
 
     # --- Salvaguarda: si queda muy poco, relajamos a solo región central ---
-    if mask.sum() < (h * w * 0.02):  # <2%
+    if mask.sum() < (h * w * 0.02):
         mask = np.ones((h, w), dtype=bool)
         if center_keep < 1.0:
             keep_w = int(w * center_keep)
@@ -233,11 +255,7 @@ def auto_colors_from_image(
 
     selected = flat[mask.reshape(-1)]
     if selected.size == 0:
-        return None, None, {
-            "pixels_used": 0,
-            "border_samples": [hex_from_rgb(c) for c in border_rgbs],
-            "palette": []
-        }
+        return None, None, {"pixels_used": 0, "border_samples": [hex_from_rgb(c) for c in border_rgbs], "palette": []}
 
     # --- Cuantización y elección principal/secundario ---
     k_eff = int(np.clip(np.sqrt(selected.shape[0] / 300), 3, k_palette))
@@ -258,11 +276,7 @@ def auto_colors_from_image(
     return (
         hex_from_rgb(c1) if c1 else None,
         hex_from_rgb(c2) if c2 else None,
-        {
-            "pixels_used": int(selected.shape[0]),
-            "border_samples": [hex_from_rgb(c) for c in border_rgbs],
-            "palette": palette_hex
-        }
+        {"pixels_used": int(selected.shape[0]), "border_samples": [hex_from_rgb(c) for c in border_rgbs], "palette": palette_hex}
     )
 
 def swatch(hex_code, label=None):
@@ -277,8 +291,8 @@ def swatch(hex_code, label=None):
     )
 
 # ---------------- UI: Crear prenda ----------------
-st.title("👕 Armario Digital — Detección automática de colores")
-st.caption("Sube una foto de **una única prenda**. Detectamos color principal y, si existe, un secundario. Todo automático.")
+st.title("👕 Armario Digital — Paleta / Hex / Auto (misma foto)")
+st.caption("Elige cómo fijar colores. Si usas detección automática, la foto de la prenda es obligatoria y se reutiliza para guardar y para detectar.")
 
 with st.form("nueva_prenda", clear_on_submit=False):
     left, right = st.columns([1, 1])
@@ -287,55 +301,101 @@ with st.form("nueva_prenda", clear_on_submit=False):
         categoria = st.selectbox("Categoría", CATEGORIAS)
         tipo = st.selectbox("Tipo", TIPOS)
 
-        foto_color = st.file_uploader("📸 Foto para detectar colores", type=["png","jpg","jpeg"], key="foto_color")
-        c1_hex = c2_hex = ""
-        meta = {}
+        st.markdown("### 🎨 Método para **color principal**")
+        metodo_principal = st.radio(
+            "Selecciona método",
+            ["Paleta", "Hex (picker)", "Automático desde imagen"],
+            index=0
+        )
 
-        if foto_color is not None:
-            img = Image.open(io.BytesIO(foto_color.getvalue()))
-            st.image(img, caption="Imagen cargada", use_container_width=True)
-
-            # --- AUTO detección con parámetros fijos ---
-            c1_hex, c2_hex, meta = auto_colors_from_image(img)
-
-            st.markdown("### 🎯 Colores detectados (automático)")
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.markdown("**Principal**")
-                if c1_hex:
-                    swatch(c1_hex, "(auto)")
-                else:
-                    st.info("No se pudo determinar color principal.")
-            with col_b:
-                st.markdown("**Secundario**")
-                if c2_hex:
-                    swatch(c2_hex, "(auto)")
-                else:
-                    st.info("No hay color secundario claro (o la prenda es monocolor).")
-
-            with st.expander("Ver detalles de paleta (opcional)"):
-                st.write("Muestras de color en bordes:", meta.get("border_samples"))
-                st.write("Paleta (count, hex, proporción):", meta.get("palette"))
-                st.caption(f"Píxeles usados tras filtros: {meta.get('pixels_used', 0)}")
-
-        # Sin ajuste manual: totalmente automático
+        st.markdown("### 🎨 Método para **color secundario**")
+        metodo_secundario = st.radio(
+            "Selecciona método",
+            ["Ninguno", "Paleta", "Hex (picker)", "Automático desde imagen"],
+            index=0
+        )
 
     with right:
-        foto_prenda = st.file_uploader("📦 Foto de la prenda a guardar (opcional)", type=["png","jpg","jpeg"], key="foto_prenda")
+        # La MISMA foto sirve para guardar y (si hace falta) para detectar
+        foto_prenda = st.file_uploader("📦 Foto de la prenda", type=["png","jpg","jpeg"], key="foto_prenda")
         if foto_prenda:
-            st.image(foto_prenda, caption="Vista previa prenda", use_container_width=True)
+            st.image(foto_prenda, caption="Vista previa prenda (esta misma se usa para detectar)", use_container_width=True)
+
+    # Campos de color (según método)
+    color1_hex = ""
+    color2_hex = ""
+
+    # Principal
+    if metodo_principal == "Paleta":
+        nombre = st.selectbox("Color principal (paleta)", list(PALETA.keys()), key="paleta_p")
+        color1_hex = PALETA[nombre]
+        swatch(color1_hex, "(paleta)")
+    elif metodo_principal == "Hex (picker)":
+        color1_hex = st.color_picker("Color principal (hex)", "#cccccc", key="hex_p")
+        swatch(color1_hex, "(hex)")
+    else:
+        if not foto_prenda:
+            st.warning("El método 'Automático desde imagen' requiere subir la foto de la prenda.")
+        else:
+            # Detectamos una sola vez para no recalcular
+            img_bytes = foto_prenda.getvalue()
+            c1_auto, c2_auto, meta = auto_colors_from_image_bytes(img_bytes, AUTO_PARAMS)
+            if c1_auto:
+                color1_hex = c1_auto
+                swatch(color1_hex, "(auto)")
+            else:
+                st.info("No se pudo detectar el color principal con esta imagen.")
+
+    # Secundario
+    if metodo_secundario == "Ninguno":
+        color2_hex = ""
+    elif metodo_secundario == "Paleta":
+        nombre2 = st.selectbox("Color secundario (paleta)", list(PALETA.keys()), key="paleta_s")
+        color2_hex = PALETA[nombre2]
+        swatch(color2_hex, "(paleta)")
+    elif metodo_secundario == "Hex (picker)":
+        color2_hex = st.color_picker("Color secundario (hex)", "#bbbbbb", key="hex_s")
+        swatch(color2_hex, "(hex)")
+    else:  # Automático desde imagen
+        if not foto_prenda:
+            st.warning("El método 'Automático desde imagen' (secundario) requiere subir la foto de la prenda.")
+        else:
+            img_bytes = foto_prenda.getvalue()
+            # Si ya hicimos auto arriba y sigue en cache, esto es instantáneo
+            c1_auto, c2_auto, meta = auto_colors_from_image_bytes(img_bytes, AUTO_PARAMS)
+            if c2_auto:
+                color2_hex = c2_auto
+                swatch(color2_hex, "(auto)")
+            else:
+                st.info("No se detecta color secundario claro (prenda monocolor).")
+
+    # Validaciones antes de guardar
+    errores = []
+    if metodo_principal == "Automático desde imagen" and not foto_prenda:
+        errores.append("Falta foto para detectar el color principal.")
+    if metodo_secundario == "Automático desde imagen" and not foto_prenda:
+        errores.append("Falta foto para detectar el color secundario.")
+    if metodo_principal != "Automático desde imagen" and not color1_hex:
+        errores.append("Selecciona un color principal válido.")
+    if metodo_secundario != "Automático desde imagen" and metodo_secundario != "Ninguno":
+        if not color2_hex:
+            errores.append("Selecciona un color secundario válido o elige 'Ninguno'.")
 
     enviado = st.form_submit_button("➕ Añadir prenda")
     if enviado:
-        nueva = pd.DataFrame([{
-            "Categoria": categoria,
-            "Tipo": tipo,
-            "Color1Hex": c1_hex or "",
-            "Color2Hex": c2_hex or "",
-            "FotoBase64": file_to_b64(foto_prenda)
-        }], columns=COLUMNS)
-        st.session_state["armario"] = pd.concat([st.session_state["armario"], nueva], ignore_index=True)
-        st.success(f"{categoria} añadida ✅")
+        if errores:
+            for e in errores:
+                st.error(e)
+        else:
+            nueva = pd.DataFrame([{
+                "Categoria": categoria,
+                "Tipo": tipo,
+                "Color1Hex": color1_hex or "",
+                "Color2Hex": color2_hex or "",
+                "FotoBase64": file_to_b64(foto_prenda)  # guarda la misma imagen (si hay)
+            }], columns=COLUMNS)
+            st.session_state["armario"] = pd.concat([st.session_state["armario"], nueva], ignore_index=True)
+            st.success(f"{categoria} añadida ✅")
 
 # ---------------- Exportar / Importar XML ----------------
 st.subheader("💾 Guardar / Cargar tu armario (XML)")
@@ -378,7 +438,7 @@ with col1:
         fname = f"armario_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}Z.xml"
         st.download_button("⬇️ Descargar XML", data=xml_bytes, file_name=fname, mime="application/xml")
     else:
-        st.info("Añade prendas para poder descargar tu armario.")
+        st.info("Añade prendas para poder descargar tu XML.")
 
 with col2:
     up = st.file_uploader("⬆️ Cargar XML", type=["xml"])
@@ -419,4 +479,8 @@ else:
             img_bytes = b64_to_bytes(row["FotoBase64"])
             if img_bytes:
                 with cols[i % 6]:
-                    st.image(img_bytes, caption=f"{row['Categoria']} ({row['Color1Hex']}" + (f", {row['Color2Hex']}" if row['Color2Hex'] else "") + ")", use_container_width=True)
+                    st.image(
+                        img_bytes,
+                        caption=f"{row['Categoria']} ({row['Color1Hex']}" + (f", {row['Color2Hex']}" if row['Color2Hex'] else "") + ")",
+                        use_container_width=True
+                    )
