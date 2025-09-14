@@ -8,11 +8,29 @@ import io, uuid, time
 st.set_page_config(page_title="Armario Digital (Cloud)", page_icon="🧥", layout="wide")
 
 # =============================================================================
-# Supabase: conexión + config
+# Supabase: conexión + secrets NORMALIZADOS (parche anti "[Errno -2]")
 # =============================================================================
-SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_ANON_KEY = st.secrets["SUPABASE_ANON_KEY"]
-SUPABASE_BUCKET = st.secrets.get("SUPABASE_BUCKET", "wardrobe-photos")  # bucket privado
+raw_url = str(st.secrets.get("SUPABASE_URL", "")).strip()
+raw_key = str(st.secrets.get("SUPABASE_ANON_KEY", "")).strip()
+raw_bucket = str(st.secrets.get("SUPABASE_BUCKET", "wardrobe-photos")).strip()
+
+# Auto-arreglos típicos
+if raw_url and not raw_url.startswith("http"):
+    raw_url = "https://" + raw_url
+raw_url = raw_url.rstrip("/")
+
+# Validaciones mínimas
+if not raw_url or ".supabase.co" not in raw_url:
+    st.error("SUPABASE_URL no es válido. Debe parecerse a: https://xxxxx.supabase.co")
+    st.stop()
+if not raw_key:
+    st.error("Falta SUPABASE_ANON_KEY en Secrets.")
+    st.stop()
+
+SUPABASE_URL = raw_url
+SUPABASE_ANON_KEY = raw_key
+SUPABASE_BUCKET = raw_bucket
+
 sb: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 # =============================================================================
@@ -83,8 +101,8 @@ def auto_colors_from_image(image: Image.Image):
     arr = np.array(image)
     hsv = rgb_to_hsv_vec(arr.reshape(-1,3)).reshape(h,w,3)
     mask = (hsv[:,:,1] >= params["sat_min"]) & (hsv[:,:,2] >= params["val_min"]) & (hsv[:,:,2] <= params["val_max"])
-    mask &= ~((hsv[:,:,2] > 0.92) & (hsv[:,:,1] < 0.20))
-    mask &= ~(hsv[:,:,2] < 0.08)
+    mask &= ~((hsv[:,:,2] > 0.92) & (hsv[:,:,1] < 0.20))  # blancos muy brillantes
+    mask &= ~(hsv[:,:,2] < 0.08)                          # sombras
     selected = arr.reshape(-1,3)[mask.reshape(-1)]
     if selected.size == 0: return None, None
     k_eff = int(np.clip(np.sqrt(selected.shape[0]/300), 3, params["k_palette"]))
@@ -178,7 +196,7 @@ with st.sidebar:
         sb.auth.sign_out()
         st.info("Sesión cerrada"); time.sleep(0.3); st.rerun()
 
-# Obtener usuario de forma segura
+# Obtener usuario de forma segura (evita crash sin sesión)
 try:
     session = sb.auth.get_session()
     user = session.user if session and getattr(session, "user", None) else None
