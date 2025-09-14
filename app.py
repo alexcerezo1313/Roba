@@ -13,7 +13,7 @@ st.set_page_config(page_title="👕 Armario Digital + Outfits", page_icon="🧥"
 # ──────────────────────────────────────────────────────────────────────────────
 CATEGORIAS = ["Camiseta", "Camisa", "Sudadera", "Pantalón", "Short", "Falda", "Zapatillas", "Botas", "Sandalias"]
 TIPOS      = ["Corto", "Largo"]
-ESTILOS    = ["Chándal", "Casual", "Formal"]  # <- solo estos
+ESTILOS    = ["Chándal", "Casual", "Formal"]  # solo estos
 
 SEASONS = ["Invierno", "Primavera", "Verano", "Otoño"]
 
@@ -24,7 +24,7 @@ COLUMNS = [
     "Estilo",
     "FotoBase64"
 ]
-SCHEMA_VERSION = "16.0"
+SCHEMA_VERSION = "17.0"
 
 AUTO_PARAMS = dict(
     center_keep=0.95, ignore_bg_mode="auto",
@@ -46,8 +46,9 @@ DEFAULT_PALETTE = {
 if "armario" not in st.session_state:
     st.session_state["armario"] = pd.DataFrame(columns=COLUMNS)
 
+# lista de dicts: {id, name, item_ids, temp_min, temp_max, seasons, elegance}
 if "outfits" not in st.session_state:
-    st.session_state["outfits"] = []   # {id, name, item_ids, temp_min, temp_max, seasons, elegance}
+    st.session_state["outfits"] = []
 
 # Estado del flujo Automático (2 fases)
 if "auto_state" not in st.session_state:
@@ -115,6 +116,7 @@ def quantize_colors(arr_rgb_uint8: np.ndarray, k=6):
     for count, idx in counts:
         r, g, b = pal[idx*3:idx*3+3]
         res.append((int(count), (int(r), int(g), int(b))))
+        # ordenado desc
     res.sort(key=lambda t: t[0], reverse=True)
     return res
 
@@ -193,7 +195,6 @@ def load_color_guide():
 
 GUIDE = load_color_guide()
 
-# Mapea hex → familia de color para la guía
 def hex_to_family(hex_code: str) -> str:
     if not hex_code: return "neutral"
     h = hex_code.lstrip("#")
@@ -224,8 +225,8 @@ def colors_compatible(hex_a: str, hex_b: str) -> bool:
     comp = GUIDE.get("compatibility", {})
     return fb in comp.get(fa, []) or fa in comp.get(fb, [])
 
-# Detecta fosforito/neón: saturación y valor muy altos
 def is_neon(hex_code: str, s_thr: float = 0.85, v_thr: float = 0.85) -> bool:
+    """Detecta colores fosforitos/neón (saturación y valor muy altos)."""
     if not hex_code: return False
     h = hex_code.lstrip("#")
     if len(h) != 6: return False
@@ -254,7 +255,7 @@ with c1:
 with c2:
     tipo = st.selectbox("Tipo", TIPOS)
 with c3:
-    estilo = st.selectbox("Estilo", ESTILOS)  # <- solo 3
+    estilo = st.selectbox("Estilo", ESTILOS)
 
 c4, c5 = st.columns([1,1])
 with c4:
@@ -428,71 +429,153 @@ if metodo in ["Paleta","Hex (picker)"]:
             st.success("Prenda guardada ✅")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Exportar / Importar armario (XML)
+# Exportar / Importar armario + outfits (XML ÚNICO)
 # ──────────────────────────────────────────────────────────────────────────────
-st.subheader("💾 Guardar / Cargar armario (XML)")
+st.subheader("💾 Guardar / Cargar armario + outfits (XML único)")
 c1, c2 = st.columns(2)
 
-def df_to_xml_bytes(df: pd.DataFrame) -> bytes:
+def export_combined_xml(armario_df: pd.DataFrame, outfits: list) -> bytes:
+    """
+    Estructura:
+    <wardrobe version="17.0">
+      <items>
+        <item>...</item>
+      </items>
+      <outfits>
+        <outfit>
+          <id>...</id>
+          <name>...</name>
+          <temp_min>...</temp_min>
+          <temp_max>...</temp_max>
+          <elegance>...</elegance>
+          <seasons><season>Invierno</season>...</seasons>
+          <item_ids><item_id>uuid</item_id>...</item_ids>
+        </outfit>
+      </outfits>
+    </wardrobe>
+    """
     root = Element("wardrobe", attrib={"version": SCHEMA_VERSION})
-    for _, row in df.iterrows():
-        item = SubElement(root, "item")
-        # Campos
-        SubElement(item, "id").text          = str(row.get("Id",""))
-        SubElement(item, "nombre").text      = str(row.get("Nombre",""))
-        SubElement(item, "categoria").text   = str(row.get("Categoria",""))
-        SubElement(item, "tipo").text        = str(row.get("Tipo",""))
-        SubElement(item, "color1hex").text   = str(row.get("Color1Hex",""))
-        SubElement(item, "color1name").text  = str(row.get("Color1Name",""))
-        SubElement(item, "color2hex").text   = str(row.get("Color2Hex",""))
-        SubElement(item, "color2name").text  = str(row.get("Color2Name",""))
-        SubElement(item, "estilo").text      = str(row.get("Estilo",""))
+
+    # items
+    items_el = SubElement(root, "items")
+    for _, row in armario_df.iterrows():
+        it = SubElement(items_el, "item")
+        SubElement(it, "id").text          = str(row.get("Id",""))
+        SubElement(it, "nombre").text      = str(row.get("Nombre",""))
+        SubElement(it, "categoria").text   = str(row.get("Categoria",""))
+        SubElement(it, "tipo").text        = str(row.get("Tipo",""))
+        SubElement(it, "color1hex").text   = str(row.get("Color1Hex",""))
+        SubElement(it, "color1name").text  = str(row.get("Color1Name",""))
+        SubElement(it, "color2hex").text   = str(row.get("Color2Hex",""))
+        SubElement(it, "color2name").text  = str(row.get("Color2Name",""))
+        SubElement(it, "estilo").text      = str(row.get("Estilo",""))
         if row.get("FotoBase64"):
-            SubElement(item, "photo_b64").text = row.get("FotoBase64")
-    buf = io.BytesIO(); ElementTree(root).write(buf, encoding="utf-8", xml_declaration=True)
+            SubElement(it, "photo_b64").text = row.get("FotoBase64")
+
+    # outfits
+    outs_el = SubElement(root, "outfits")
+    for o in outfits:
+        oe = SubElement(outs_el, "outfit")
+        SubElement(oe, "id").text        = str(o.get("id",""))
+        SubElement(oe, "name").text      = str(o.get("name",""))
+        SubElement(oe, "temp_min").text  = str(o.get("temp_min",""))
+        SubElement(oe, "temp_max").text  = str(o.get("temp_max",""))
+        SubElement(oe, "elegance").text  = str(o.get("elegance",""))
+        # seasons
+        seas_el = SubElement(oe, "seasons")
+        for s in o.get("seasons", []):
+            SubElement(seas_el, "season").text = str(s)
+        # item ids
+        ids_el = SubElement(oe, "item_ids")
+        for iid in o.get("item_ids", []):
+            SubElement(ids_el, "item_id").text = str(iid)
+
+    buf = io.BytesIO()
+    ElementTree(root).write(buf, encoding="utf-8", xml_declaration=True)
     return buf.getvalue()
 
-def xml_bytes_to_df(xml_bytes: bytes) -> pd.DataFrame:
+def import_combined_xml(xml_bytes: bytes):
+    """
+    Devuelve (df_armario, outfits_list). Soporta XMLs antiguos sin <outfits>.
+    """
     try:
-        root = fromstring(xml_bytes); rows = []
-        for it in root.findall("item"):
-            rows.append({
-                "Id": it.findtext("id","") or str(uuid.uuid4()),
-                "Nombre": it.findtext("nombre",""),
-                "Categoria": it.findtext("categoria",""),
-                "Tipo": it.findtext("tipo",""),
-                "Color1Hex": it.findtext("color1hex",""),
-                "Color1Name": it.findtext("color1name",""),
-                "Color2Hex": it.findtext("color2hex",""),
-                "Color2Name": it.findtext("color2name",""),
-                "Estilo": it.findtext("estilo",""),
-                "FotoBase64": it.findtext("photo_b64","") or ""
-            })
-        return pd.DataFrame(rows, columns=COLUMNS)
+        root = fromstring(xml_bytes)
     except Exception as e:
         st.error(f"XML no válido: {e}")
-        return pd.DataFrame(columns=COLUMNS)
+        return pd.DataFrame(columns=COLUMNS), []
+
+    # items (soporta viejo formato sin <items>)
+    rows = []
+    items_parent = root.find("items")
+    if items_parent is not None:
+        items = items_parent.findall("item")
+    else:
+        # backward-compat: items directamente bajo root
+        items = root.findall("item")
+    for it in items:
+        rows.append({
+            "Id": it.findtext("id","") or str(uuid.uuid4()),
+            "Nombre": it.findtext("nombre",""),
+            "Categoria": it.findtext("categoria",""),
+            "Tipo": it.findtext("tipo",""),
+            "Color1Hex": it.findtext("color1hex",""),
+            "Color1Name": it.findtext("color1name",""),
+            "Color2Hex": it.findtext("color2hex",""),
+            "Color2Name": it.findtext("color2name",""),
+            "Estilo": it.findtext("estilo",""),
+            "FotoBase64": it.findtext("photo_b64","") or ""
+        })
+    df_items = pd.DataFrame(rows, columns=COLUMNS)
+
+    # outfits (puede no existir)
+    outfits = []
+    outs_parent = root.find("outfits")
+    if outs_parent is not None:
+        for oe in outs_parent.findall("outfit"):
+            seasons = [se.text for se in (oe.find("seasons").findall("season") if oe.find("seasons") is not None else [])]
+            item_ids = [ie.text for ie in (oe.find("item_ids").findall("item_id") if oe.find("item_ids") is not None else [])]
+            outfits.append({
+                "id": oe.findtext("id","") or str(uuid.uuid4()),
+                "name": oe.findtext("name",""),
+                "item_ids": item_ids,
+                "temp_min": int(oe.findtext("temp_min","0") or 0),
+                "temp_max": int(oe.findtext("temp_max","0") or 0),
+                "seasons": seasons,
+                "elegance": int(oe.findtext("elegance","3") or 3)
+            })
+
+    return df_items, outfits
 
 with c1:
-    if not st.session_state["armario"].empty:
-        st.download_button(
-            "⬇️ Descargar XML",
-            data=df_to_xml_bytes(st.session_state["armario"]),
-            file_name=f"armario_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}Z.xml",
-            mime="application/xml"
-        )
+    if not st.session_state["armario"].empty or st.session_state["outfits"]:
+        xml_bytes = export_combined_xml(st.session_state["armario"], st.session_state["outfits"])
+        fname = f"wardrobe_outfits_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}Z.xml"
+        st.download_button("⬇️ Descargar XML combinado", data=xml_bytes, file_name=fname, mime="application/xml")
     else:
-        st.info("Añade prendas para poder descargar tu armario.")
+        st.info("Añade prendas o outfits para poder descargar el XML.")
 
 with c2:
-    up = st.file_uploader("⬆️ Cargar XML", type=["xml"])
+    up = st.file_uploader("⬆️ Cargar XML combinado", type=["xml"])
     modo = st.radio("Cómo cargar", ["Añadir", "Reemplazar"], horizontal=True)
     if up is not None:
-        df_imp = xml_bytes_to_df(up.read())
-        if not df_imp.empty:
-            if modo == "Reemplazar": st.session_state["armario"] = df_imp
-            else: st.session_state["armario"] = pd.concat([st.session_state["armario"], df_imp], ignore_index=True)
-            st.success("XML cargado ✅")
+        df_imp, outfits_imp = import_combined_xml(up.read())
+        if not df_imp.empty or outfits_imp:
+            if modo == "Reemplazar":
+                st.session_state["armario"] = df_imp
+                st.session_state["outfits"] = outfits_imp
+            else:
+                # añadir items (evitar duplicar Id)
+                cur = st.session_state["armario"]
+                new = pd.concat([cur, df_imp], ignore_index=True)
+                if not new.empty:
+                    new = new.drop_duplicates(subset=["Id"], keep="first")
+                st.session_state["armario"] = new
+                # añadir outfits (evitar duplicar id)
+                cur_o = {o["id"]: o for o in st.session_state["outfits"]}
+                for o in outfits_imp:
+                    cur_o.setdefault(o["id"], o)
+                st.session_state["outfits"] = list(cur_o.values())
+            st.success("XML combinado cargado ✅")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # OUTFITS (Sidebar)
@@ -510,7 +593,7 @@ def filter_prendas_for_weather(df, tmin, tmax, season, elegance):
     if tmax <= 12:  # frío
         df = df[~(df["Categoria"].isin(["Short","Falda","Sandalias"]))]
 
-    # Elegancia aproximada por estilo (1 chándal, 2 casual, 3-4 formal)
+    # Elegancia aproximada por estilo (1 chándal, 2 casual, 4 formal)
     estilo_rank = {"Chándal":1, "Casual":2, "Formal":4}
     df["ElegScore"] = df["Estilo"].map(estilo_rank).fillna(2)
 
@@ -523,18 +606,8 @@ def filter_prendas_for_weather(df, tmin, tmax, season, elegance):
     df = df[np.abs(df["ElegScore"] - elegance) <= 1]
     return df
 
-def load_guide():
-    return GUIDE
-
-def hex_to_family_local(h):
-    return hex_to_family(h)
-
-def colors_compatible_local(a,b):
-    return colors_compatible(a,b)
-
 def pick_by_color(top_hex, candidates_hex):
-    """Elige candidatos compatibles; si no hay, devuelve todos."""
-    compatible = [h for h in candidates_hex if colors_compatible_local(top_hex, h)]
+    compatible = [h for h in candidates_hex if colors_compatible(top_hex, h)]
     return compatible if compatible else candidates_hex
 
 def auto_build_outfit(df, tmin, tmax, season, elegance):
@@ -577,8 +650,7 @@ def auto_build_outfit(df, tmin, tmax, season, elegance):
     else:
         shoe = shoe_pool.iloc[[shoes_hexs.index(np.random.choice(good_s))]]
 
-    outfit_ids = [top.iloc[0]["Id"], bottom.iloc[0]["Id"], shoe.iloc[0]["Id"]]
-    return outfit_ids
+    return [top.iloc[0]["Id"], bottom.iloc[0]["Id"], shoe.iloc[0]["Id"]]
 
 # Crear outfit manual
 with st.sidebar.expander("✍️ Crear outfit manual", expanded=False):
@@ -592,16 +664,14 @@ with st.sidebar.expander("✍️ Crear outfit manual", expanded=False):
         eleg = st.slider("Elegancia (1 poco · 5 mucho)", 1, 5, 3)
         df = st.session_state["armario"]
 
-        # aviso si formal y hay neón
-        warn_neon = False
         ids = st.multiselect("Prendas (por nombre)", df["Nombre"].tolist())
         chosen = df[df["Nombre"].isin(ids)]
+
+        # aviso si formal y hay neón
         if eleg >= 4 and not chosen.empty:
             neon_mask = (chosen["Color1Hex"].apply(is_neon)) | (chosen["Color2Hex"].apply(is_neon))
             if neon_mask.any():
-                warn_neon = True
-        if warn_neon:
-            st.warning("Has seleccionado colores tipo neón. No se recomiendan para un outfit **Formal**.")
+                st.warning("Has seleccionado colores tipo neón. No se recomiendan para un outfit **Formal**.")
 
         if st.button("Guardar outfit manual"):
             chosen_ids = chosen["Id"].tolist()
@@ -679,33 +749,6 @@ with st.sidebar.expander("📚 Usar outfit guardado", expanded=False):
                     row = df.loc[pid]
                     st.write(f"- {row['Nombre']} · {row['Categoria']} ({row['Tipo']}) · {row['Estilo']}")
                     swatch(row["Color1Hex"] or row["Color2Hex"])
-
-# Exportar/Importar outfits
-st.sidebar.markdown("---")
-st.sidebar.subheader("💾 Outfits (exportar/importar)")
-def outfits_to_bytes(outfits: list) -> bytes:
-    return json.dumps(outfits, ensure_ascii=False, indent=2).encode("utf-8")
-
-def outfits_from_bytes(b: bytes) -> list:
-    try:
-        return json.loads(b.decode("utf-8"))
-    except Exception:
-        return []
-
-st.sidebar.download_button(
-    "⬇️ Exportar outfits (.json)",
-    data=outfits_to_bytes(st.session_state["outfits"]),
-    file_name="outfits.json",
-    mime="application/json"
-)
-imp = st.sidebar.file_uploader("⬆️ Importar outfits", type=["json"])
-if imp is not None:
-    data = outfits_from_bytes(imp.read())
-    if isinstance(data, list):
-        st.session_state["outfits"] = data
-        st.sidebar.success("Outfits importados ✅")
-    else:
-        st.sidebar.error("Archivo JSON no válido.")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Vista del armario
