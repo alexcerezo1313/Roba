@@ -2,4 +2,3 @@ streamlit
 pandas
 pillow
 numpy
-streamlit-cropper
