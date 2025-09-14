@@ -2,58 +2,64 @@ import streamlit as st
 import pandas as pd
 from xml.etree.ElementTree import Element, SubElement, ElementTree, fromstring
 from datetime import datetime
-import base64, io
+import base64, io, json, os, uuid
 from PIL import Image
 import numpy as np
 
-st.set_page_config(page_title="👕 Armario Digital", page_icon="🧥", layout="wide")
+st.set_page_config(page_title="👕 Armario Digital + Outfits", page_icon="🧥", layout="wide")
 
-# ---------------- Config ----------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
 CATEGORIAS = ["Camiseta", "Camisa", "Sudadera", "Pantalón", "Short", "Falda", "Zapatillas", "Botas", "Sandalias"]
-TIPOS = ["Corto", "Largo"]
-COLUMNS = ["Categoria", "Tipo", "Color1Hex", "Color1Name", "Color2Hex", "Color2Name", "FotoBase64"]
-SCHEMA_VERSION = "14.0"
+TIPOS      = ["Corto", "Largo"]
+ESTILOS    = ["Chándal", "Casual", "Formal"]  # <- solo estos
 
-PALETA = {
-    "Negro": "#000000",
-    "Blanco": "#FFFFFF",
-    "Gris": "#808080",
-    "Beige": "#F5F5DC",
-    "Marrón": "#8B4513",
-    "Azul marino": "#000080",
-    "Azul claro": "#87CEEB",
-    "Rojo": "#FF0000",
-    "Verde": "#008000",
-    "Amarillo": "#FFFF00",
-    "Rosa": "#FFC0CB"
-}
+SEASONS = ["Invierno", "Primavera", "Verano", "Otoño"]
+
+COLUMNS = [
+    "Id", "Nombre", "Categoria", "Tipo",
+    "Color1Hex", "Color1Name",
+    "Color2Hex", "Color2Name",
+    "Estilo",
+    "FotoBase64"
+]
+SCHEMA_VERSION = "16.0"
 
 AUTO_PARAMS = dict(
-    center_keep=0.95,
-    ignore_bg_mode="auto",
-    exclude_skin=False,
-    exclude_border=True,
-    sat_min=0.12,
-    val_min=0.12,
-    val_max=0.98,
-    border_sim_thresh=0.18,
-    k_palette=7,
-    min_dist=0.28,
-    min_prop_secondary=0.10,
-    user_bg_hex=None
+    center_keep=0.95, ignore_bg_mode="auto",
+    exclude_skin=False, exclude_border=True,
+    sat_min=0.12, val_min=0.12, val_max=0.98,
+    border_sim_thresh=0.18, k_palette=7,
+    min_dist=0.28, min_prop_secondary=0.10, user_bg_hex=None
 )
 
+DEFAULT_PALETTE = {
+    "Negro": "#000000", "Blanco": "#FFFFFF", "Gris": "#808080", "Beige": "#F5F5DC",
+    "Marrón": "#8B4513", "Azul marino": "#000080", "Azul claro": "#87CEEB",
+    "Rojo": "#FF0000", "Verde": "#008000", "Amarillo": "#FFFF00", "Rosa": "#FFC0CB"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Estado
+# ──────────────────────────────────────────────────────────────────────────────
 if "armario" not in st.session_state:
     st.session_state["armario"] = pd.DataFrame(columns=COLUMNS)
-# Estado para el flujo Automático (fase 2)
+
+if "outfits" not in st.session_state:
+    st.session_state["outfits"] = []   # {id, name, item_ids, temp_min, temp_max, seasons, elegance}
+
+# Estado del flujo Automático (2 fases)
 if "auto_state" not in st.session_state:
     st.session_state["auto_state"] = {
         "ready": False, "c1": "", "c2": "", "n1": "", "n2": "",
-        "foto_b64": "", "categoria": "", "tipo": "", "hay_sec": False
+        "foto_b64": "", "categoria": "", "tipo": "", "hay_sec": False,
+        "nombre_prenda": "", "estilo": ESTILOS[1]
     }
 
-# ---------------- Utils ----------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Utilidades de color / imagen
+# ──────────────────────────────────────────────────────────────────────────────
 def file_to_b64(uploaded_file) -> str:
     if uploaded_file is None:
         return ""
@@ -72,9 +78,7 @@ def hex_from_rgb(rgb):
 def rgb_to_hsv_vec(rgb_arr_uint8: np.ndarray) -> np.ndarray:
     rgb = rgb_arr_uint8.astype(np.float32) / 255.0
     r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
-    mx = np.max(rgb, axis=1)
-    mn = np.min(rgb, axis=1)
-    diff = mx - mn
+    mx = np.max(rgb, axis=1); mn = np.min(rgb, axis=1); diff = mx - mn
     h = np.zeros_like(mx)
     mask_r = (mx == r) & (diff != 0)
     mask_g = (mx == g) & (diff != 0)
@@ -83,8 +87,7 @@ def rgb_to_hsv_vec(rgb_arr_uint8: np.ndarray) -> np.ndarray:
     h[mask_g] = (b[mask_g] - r[mask_g]) / diff[mask_g] + 2
     h[mask_b] = (r[mask_b] - g[mask_b]) / diff[mask_b] + 4
     h = (h / 6.0) % 1.0
-    s = np.zeros_like(mx)
-    s[mx != 0] = diff[mx != 0] / mx[mx != 0]
+    s = np.zeros_like(mx); s[mx != 0] = diff[mx != 0] / mx[mx != 0]
     v = mx
     return np.stack([h, s, v], axis=1)
 
@@ -92,34 +95,16 @@ def color_distance_hsv(c1_rgb, c2_rgb):
     def single(rgb):
         arr = np.array(rgb, dtype=np.uint8).reshape(1, 3)
         return rgb_to_hsv_vec(arr)[0]
-    h1, s1, v1 = single(c1_rgb)
-    h2, s2, v2 = single(c2_rgb)
+    h1, s1, v1 = single(c1_rgb); h2, s2, v2 = single(c2_rgb)
     dh = min(abs(h1 - h2), 1 - abs(h1 - h2)) * 2.0
-    ds = abs(s1 - s2)
-    dv = abs(v1 - v2)
+    ds = abs(s1 - s2); dv = abs(v1 - v2)
     return dh * 0.6 + ds * 0.8 + dv * 0.4
 
-def rgb_to_ycrcb_vec(rgb_arr_uint8: np.ndarray) -> np.ndarray:
-    R = rgb_arr_uint8[:, 0].astype(np.float32)
-    G = rgb_arr_uint8[:, 1].astype(np.float32)
-    B = rgb_arr_uint8[:, 2].astype(np.float32)
-    Y  =  0.299*R + 0.587*G + 0.114*B
-    Cb = 128 - 0.168736*R - 0.331264*G + 0.5*B
-    Cr = 128 + 0.5*R - 0.418688*G - 0.081312*B
-    out = np.stack([Y, Cr, Cb], axis=1)
-    return np.clip(out, 0, 255)
-
-def skin_mask(rgb_arr_uint8: np.ndarray) -> np.ndarray:
-    ycrcb = rgb_to_ycrcb_vec(rgb_arr_uint8)
-    Cr = ycrcb[:, 1]; Cb = ycrcb[:, 2]
-    return (Cr >= 133) & (Cr <= 173) & (Cb >= 77) & (Cb <= 127)
-
 def quantize_colors(arr_rgb_uint8: np.ndarray, k=6):
-    if arr_rgb_uint8.size == 0:
-        return []
+    if arr_rgb_uint8.size == 0: return []
     n = arr_rgb_uint8.shape[0]
     w = int(np.ceil(np.sqrt(n))); h = int(np.ceil(n / w))
-    pad = w * h - n
+    pad = w*h - n
     if pad > 0:
         arr_rgb_uint8 = np.vstack([arr_rgb_uint8, np.tile(arr_rgb_uint8[-1], (pad, 1))])
     img = Image.fromarray(arr_rgb_uint8.reshape(h, w, 3), mode="RGB")
@@ -133,80 +118,27 @@ def quantize_colors(arr_rgb_uint8: np.ndarray, k=6):
     res.sort(key=lambda t: t[0], reverse=True)
     return res
 
-def estimate_border_colors(arr_rgb_uint8: np.ndarray, width: int, height: int, border_frac: float = 0.06):
-    bf = max(1, int(min(width, height) * border_frac))
-    img2d = arr_rgb_uint8.reshape(height, width, 3)
-    top = img2d[:bf, :, :].reshape(-1, 3).mean(0)
-    bottom = img2d[-bf:, :, :].reshape(-1, 3).mean(0)
-    left = img2d[:, :bf, :].reshape(-1, 3).mean(0)
-    right = img2d[:, -bf:, :].reshape(-1, 3).mean(0)
-    return [tuple(int(x) for x in top), tuple(int(x) for x in bottom),
-            tuple(int(x) for x in left), tuple(int(x) for x in right)]
-
 def auto_colors_from_image(image: Image.Image, params: dict):
-    # Reducción
     w0, h0 = image.size
     scale = min(640 / max(w0, h0), 1.0)
     if scale < 1.0:
         image = image.resize((int(w0*scale), int(h0*scale)), Image.LANCZOS)
     w, h = image.size
-    arr = np.array(image)
-    flat = arr.reshape(-1, 3).astype(np.uint8)
+    arr = np.array(image); flat = arr.reshape(-1, 3).astype(np.uint8)
 
-    # Región central
-    center_keep = params["center_keep"]
-    mask = np.ones((h, w), dtype=bool)
-    if center_keep < 1.0:
-        keep_w = int(w * center_keep); keep_h = int(h * center_keep)
-        x0 = (w - keep_w) // 2; y0 = (h - keep_h) // 2
-        central = np.zeros_like(mask); central[y0:y0+keep_h, x0:x0+keep_w] = True
-        mask &= central
+    hsv = rgb_to_hsv_vec(flat).reshape(h, w, 3)
+    mask = (hsv[:, :, 1] >= params["sat_min"]) & (hsv[:, :, 2] >= params["val_min"]) & (hsv[:, :, 2] <= params["val_max"])
+    if params["ignore_bg_mode"] == "auto":
+        mask &= ~((hsv[:, :, 2] > 0.92) & (hsv[:, :, 1] < 0.20))
+        mask &= ~(hsv[:, :, 2] < 0.08)
 
-    # HSV filtros
-    hsv = rgb_to_hsv_vec(flat); hsv2d = hsv.reshape(h, w, 3)
-    mask &= (hsv2d[:, :, 1] >= params["sat_min"]) & (hsv2d[:, :, 2] >= params["val_min"]) & (hsv2d[:, :, 2] <= params["val_max"])
-
-    # Fondo
-    mode = params["ignore_bg_mode"]
-    if mode == "auto":
-        mask &= ~((hsv2d[:, :, 2] > 0.92) & (hsv2d[:, :, 1] < 0.20))
-        mask &= ~(hsv2d[:, :, 2] < 0.08)
-    elif mode == "claro":
-        mask &= ~((hsv2d[:, :, 2] > 0.90) & (hsv2d[:, :, 1] < 0.25))
-    elif mode == "oscuro":
-        mask &= ~(hsv2d[:, :, 2] < 0.12)
-
-    # Piel (opcional)
-    if params["exclude_skin"]:
-        skin2d = skin_mask(flat).reshape(h, w)
-        mask &= ~skin2d
-
-    # Bordes
-    border_rgbs = []
-    if params["exclude_border"]:
-        border_rgbs = estimate_border_colors(flat, w, h, border_frac=0.06)
-        hsv_all = hsv
-        for bg in border_rgbs:
-            hsv_bg = rgb_to_hsv_vec(np.array([bg], dtype=np.uint8))[0]
-            dh = np.minimum(np.abs(hsv_all[:, 0] - hsv_bg[0]), 1 - np.abs(hsv_all[:, 0] - hsv_bg[0])) * 2.0
-            ds = np.abs(hsv_all[:, 1] - hsv_bg[1])
-            dv = np.abs(hsv_all[:, 2] - hsv_bg[2])
-            dist = dh * 0.6 + ds * 0.8 + dv * 0.4
-            mask &= (dist.reshape(h, w) > params["border_sim_thresh"])
-
-    # Salvaguarda
-    if mask.sum() < (h * w * 0.02):
-        mask = np.ones((h, w), dtype=bool)
-    selected = flat[mask.reshape(-1)]
+    selected = arr.reshape(-1, 3)[mask.reshape(-1)]
     if selected.size == 0:
         return None, None, {}
 
-    # Cuantización
     k_eff = int(np.clip(np.sqrt(selected.shape[0] / 300), 3, params["k_palette"]))
     pal = quantize_colors(selected, k=k_eff)
     total = sum(c for c, _ in pal) if pal else 1
-
-    # Elegir (distintos)
     c1 = None; c2 = None
     if pal:
         c1 = pal[0][1]
@@ -214,347 +146,586 @@ def auto_colors_from_image(image: Image.Image, params: dict):
             prop = cnt / total
             if prop >= params["min_prop_secondary"] and color_distance_hsv(c1, rgb) >= params["min_dist"]:
                 c2 = rgb; break
+    return hex_from_rgb(c1) if c1 else None, hex_from_rgb(c2) if c2 else None, {}
 
-    return (hex_from_rgb(c1) if c1 else None,
-            hex_from_rgb(c2) if c2 else None,
-            {})
+def swatch(hex_code, label=None):
+    if not hex_code: return
+    lab = f"&nbsp;{label}" if label else ""
+    st.markdown(
+        f"<div style='display:flex;align-items:center;gap:8px;'>"
+        f"<div style='width:22px;height:22px;border-radius:6px;border:1px solid #000;background:{hex_code};'></div>"
+        f"<code>{hex_code}</code>{lab}"
+        f"</div>", unsafe_allow_html=True
+    )
 
-def swatch_with_label(hex_code, title):
-    st.markdown(f"**{title}**")
-    if hex_code:
-        st.markdown(
-            f"<div style='display:flex;align-items:center;gap:8px;'>"
-            f"<div style='width:28px;height:28px;border-radius:6px;border:1px solid #000;background:{hex_code};'></div>"
-            f"<code>{hex_code}</code>"
-            f"</div>", unsafe_allow_html=True
-        )
-    else:
-        st.info("—")
+# ──────────────────────────────────────────────────────────────────────────────
+# Guía de colores (archivo externo opcional)
+# ──────────────────────────────────────────────────────────────────────────────
+DEFAULT_GUIDE = {
+    "families": ["neutral","black","white","gray","beige","brown","red","orange","yellow","green","cyan","blue","purple","pink"],
+    "compatibility": {
+        "neutral": ["red","orange","yellow","green","cyan","blue","purple","pink","brown","beige","gray","black","white"],
+        "black":    ["red","orange","yellow","green","cyan","blue","purple","pink","beige","gray","white"],
+        "white":    ["red","orange","yellow","green","cyan","blue","purple","pink","brown","beige","gray","black"],
+        "gray":     ["red","orange","yellow","green","cyan","blue","purple","pink","brown","beige","black","white"],
+        "beige":    ["brown","white","black","green","blue","pink","red"],
+        "brown":    ["beige","green","blue","white","pink"],
+        "red":      ["neutral","white","black","gray","beige","blue","green","pink"],
+        "orange":   ["neutral","white","black","gray","blue","green","brown"],
+        "yellow":   ["neutral","white","black","gray","blue","green","brown"],
+        "green":    ["neutral","white","black","gray","beige","brown","blue","red","yellow"],
+        "cyan":     ["neutral","white","black","gray","blue","purple"],
+        "blue":     ["neutral","white","black","gray","beige","brown","green","red","yellow","pink"],
+        "purple":   ["neutral","white","black","gray","pink","yellow","green"],
+        "pink":     ["neutral","white","black","gray","blue","red","beige"]
+    }
+}
 
-# ---------------- UI principal ----------------
-st.title("👕 Armario Digital — Paleta / Hex / Automático en 2 fases")
-st.caption("En **Automático** primero **Detectar colores**; luego podrás **Añadir prenda**.")
+def load_color_guide():
+    path = "color_guide.json"
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return DEFAULT_GUIDE
 
-# Datos comunes
-c_top1, c_top2, c_top3 = st.columns([1,1,1])
-with c_top1:
-    categoria = st.selectbox("Categoría", CATEGORIAS, key="ui_categoria")
-with c_top2:
-    tipo = st.selectbox("Tipo", TIPOS, key="ui_tipo")
-with c_top3:
-    metodo = st.radio("Método de color", ["Paleta", "Hex (picker)", "Automático desde imagen"], key="ui_metodo")
+GUIDE = load_color_guide()
 
-hay_secundario = st.checkbox("¿La prenda tiene color secundario?", value=False, key="ui_hay_sec")
+# Mapea hex → familia de color para la guía
+def hex_to_family(hex_code: str) -> str:
+    if not hex_code: return "neutral"
+    h = hex_code.lstrip("#")
+    if len(h) != 6: return "neutral"
+    r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+    # neutrales
+    if max(r,g,b) - min(r,g,b) < 18:
+        if max(r,g,b) > 230: return "white"
+        if max(r,g,b) < 35:  return "black"
+        return "gray"
+    # beige / marrón simples
+    if r>200 and g>200 and b<160: return "beige"
+    if r>90 and g<110 and b<110:  return "brown"
+    # HSV
+    hsv = rgb_to_hsv_vec(np.array([[r,g,b]], dtype=np.uint8))[0]
+    hue = hsv[0]*360
+    if   hue < 15 or hue >= 345: return "red"
+    elif hue < 45:  return "orange"
+    elif hue < 70:  return "yellow"
+    elif hue < 170: return "green"
+    elif hue < 200: return "cyan"
+    elif hue < 260: return "blue"
+    elif hue < 310: return "purple"
+    else:           return "pink"
 
-# ---------------- Método: Paleta ----------------
+def colors_compatible(hex_a: str, hex_b: str) -> bool:
+    fa, fb = hex_to_family(hex_a), hex_to_family(hex_b)
+    comp = GUIDE.get("compatibility", {})
+    return fb in comp.get(fa, []) or fa in comp.get(fb, [])
+
+# Detecta fosforito/neón: saturación y valor muy altos
+def is_neon(hex_code: str, s_thr: float = 0.85, v_thr: float = 0.85) -> bool:
+    if not hex_code: return False
+    h = hex_code.lstrip("#")
+    if len(h) != 6: return False
+    r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+    hsv = rgb_to_hsv_vec(np.array([[r,g,b]], dtype=np.uint8))[0]
+    s, v = float(hsv[1]), float(hsv[2])
+    return (s >= s_thr) and (v >= v_thr)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cabecera
+# ──────────────────────────────────────────────────────────────────────────────
+st.title("👕 Armario Digital + 🧩 Outfits")
+st.caption("Estilos: Chándal, Casual y Formal. En **Formal** se evitan colores fosforitos/neón.")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Formulario de prenda con flujo de detección automática (2 fases)
+# ──────────────────────────────────────────────────────────────────────────────
+st.markdown("## ➕ Añadir prenda")
+
+# Campos básicos
+c0, c1, c2, c3 = st.columns([1.2, 1, 1, 1])
+with c0:
+    nombre_prenda = st.text_input("Nombre de la prenda", placeholder="Ej. Sudadera azul marino")
+with c1:
+    categoria = st.selectbox("Categoría", CATEGORIAS)
+with c2:
+    tipo = st.selectbox("Tipo", TIPOS)
+with c3:
+    estilo = st.selectbox("Estilo", ESTILOS)  # <- solo 3
+
+c4, c5 = st.columns([1,1])
+with c4:
+    metodo = st.radio("Método de color", ["Paleta", "Hex (picker)", "Automático desde imagen"], horizontal=True)
+with c5:
+    hay_secundario = st.checkbox("¿La prenda tiene color secundario?")
+
+# Imagen pequeña a un lado
+ic1, ic2 = st.columns([1,2])
+with ic1:
+    foto_prenda = st.file_uploader("Foto (obligatoria en 'Automático')", type=["png","jpg","jpeg"])
+    if foto_prenda:
+        st.image(foto_prenda, caption="Vista previa", use_container_width=True)
+with ic2:
+    st.info("Consejo: fondos neutros mejoran la detección de color.")
+
+# Paleta / Hex / Automático
+color1_hex = ""; color2_hex = ""; color1_name = ""; color2_name = ""
+
 if metodo == "Paleta":
-    with st.form("form_paleta", clear_on_submit=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            n1 = st.selectbox("Color principal (paleta)", list(PALETA.keys()), key="paleta_p")
-            c1_hex = PALETA[n1]
-            swatch_with_label(c1_hex, "Principal")
-        c2_hex = ""
-        if hay_secundario:
-            with col2:
-                n2 = st.selectbox("Color secundario (paleta)", list(PALETA.keys()), key="paleta_s")
-                c2_hex = PALETA[n2]
-                swatch_with_label(c2_hex, "Secundario")
+    p1, p2 = st.columns(2)
+    with p1:
+        nombre_pal = st.selectbox("Principal (paleta)", list(DEFAULT_PALETTE.keys()))
+        color1_hex = DEFAULT_PALETTE[nombre_pal]; color1_name = ""
+        swatch(color1_hex, "principal")
+    if hay_secundario:
+        with p2:
+            nombre_pal2 = st.selectbox("Secundario (paleta)", list(DEFAULT_PALETTE.keys()))
+            color2_hex = DEFAULT_PALETTE[nombre_pal2]; color2_name = ""
+            swatch(color2_hex, "secundario")
 
-        st.markdown("**Nombres (opcionales)**")
-        ncol1, ncol2 = st.columns(2)
-        with ncol1:
-            c1_name = st.text_input("Nombre para principal", value="", key="paleta_name1")
-        c2_name = ""
-        if hay_secundario:
-            with ncol2:
-                c2_name = st.text_input("Nombre para secundario", value="", key="paleta_name2")
+    n1, n2 = st.columns(2)
+    with n1:
+        color1_name = st.text_input("Nombre color principal (opcional)")
+    if hay_secundario:
+        with n2:
+            color2_name = st.text_input("Nombre color secundario (opcional)")
 
-        foto = st.file_uploader("📦 Foto de la prenda (opcional)", type=["png","jpg","jpeg"], key="paleta_foto")
-
-        errs = []
-        if hay_secundario and c1_hex.lower() == c2_hex.lower():
-            errs.append("El color secundario debe ser distinto del principal.")
-        submit = st.form_submit_button("➕ Añadir prenda")
-        if submit:
-            if errs:
-                for e in errs: st.error(e)
-            else:
-                nueva = pd.DataFrame([{
-                    "Categoria": categoria, "Tipo": tipo,
-                    "Color1Hex": c1_hex, "Color1Name": c1_name,
-                    "Color2Hex": c2_hex if hay_secundario else "", "Color2Name": c2_name if hay_secundario else "",
-                    "FotoBase64": file_to_b64(foto)
-                }], columns=COLUMNS)
-                st.session_state["armario"] = pd.concat([st.session_state["armario"], nueva], ignore_index=True)
-                st.success(f"{categoria} añadida ✅")
-
-# ---------------- Método: Hex ----------------
 elif metodo == "Hex (picker)":
-    with st.form("form_hex", clear_on_submit=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            c1_hex = st.color_picker("Color principal (hex)", "#cccccc", key="hex_p")
-            swatch_with_label(c1_hex, "Principal")
-        c2_hex = ""
-        if hay_secundario:
-            with col2:
-                c2_hex = st.color_picker("Color secundario (hex)", "#bbbbbb", key="hex_s")
-                swatch_with_label(c2_hex, "Secundario")
+    p1, p2 = st.columns(2)
+    with p1:
+        color1_hex = st.color_picker("Principal (hex)", "#3366cc")
+        swatch(color1_hex, "principal")
+    if hay_secundario:
+        with p2:
+            color2_hex = st.color_picker("Secundario (hex)", "#bbbbbb")
+            swatch(color2_hex, "secundario")
 
-        st.markdown("**Nombres (opcionales)**")
-        ncol1, ncol2 = st.columns(2)
-        with ncol1:
-            c1_name = st.text_input("Nombre para principal", value="", key="hex_name1")
-        c2_name = ""
-        if hay_secundario:
-            with ncol2:
-                c2_name = st.text_input("Nombre para secundario", value="", key="hex_name2")
+    n1, n2 = st.columns(2)
+    with n1:
+        color1_name = st.text_input("Nombre color principal (opcional)")
+    if hay_secundario:
+        with n2:
+            color2_name = st.text_input("Nombre color secundario (opcional)")
 
-        foto = st.file_uploader("📦 Foto de la prenda (opcional)", type=["png","jpg","jpeg"], key="hex_foto")
-
-        errs = []
-        if not c1_hex: errs.append("Selecciona el color principal.")
-        if hay_secundario and not c2_hex: errs.append("Has indicado color secundario: defínelo.")
-        if hay_secundario and c1_hex.lower() == c2_hex.lower():
-            errs.append("El color secundario debe ser distinto del principal.")
-        submit = st.form_submit_button("➕ Añadir prenda")
-        if submit:
-            if errs:
-                for e in errs: st.error(e)
-            else:
-                nueva = pd.DataFrame([{
-                    "Categoria": categoria, "Tipo": tipo,
-                    "Color1Hex": c1_hex, "Color1Name": c1_name,
-                    "Color2Hex": c2_hex if hay_secundario else "", "Color2Name": c2_name if hay_secundario else "",
-                    "FotoBase64": file_to_b64(foto)
-                }], columns=COLUMNS)
-                st.session_state["armario"] = pd.concat([st.session_state["armario"], nueva], ignore_index=True)
-                st.success(f"{categoria} añadida ✅")
-
-# ---------------- Método: Automático (2 fases) ----------------
 else:
-    # Fase 1: inputs + botón Detectar colores (no guarda)
-    foto = st.file_uploader("📦 Foto de la prenda (obligatoria)", type=["png","jpg","jpeg"], key="auto_foto")
-    if foto:
-        st.image(foto, caption="Vista previa (se usa para detectar y guardar)", use_container_width=True)
-
-    detect = st.button("🔍 Detectar colores")
-    if detect:
-        errs = []
-        if not foto:
-            errs.append("Debes subir la foto para detectar colores.")
-        if errs:
-            for e in errs: st.error(e)
+    # Fase 1: Detectar
+    det = st.button("🔍 Detectar colores")
+    if det:
+        errors = []
+        if not foto_prenda:
+            errors.append("Sube la foto para detectar los colores.")
+        if errors:
+            for e in errors: st.error(e)
         else:
-            img = Image.open(io.BytesIO(foto.getvalue())).convert("RGB")
+            img = Image.open(io.BytesIO(foto_prenda.getvalue())).convert("RGB")
             c1, c2, _ = auto_colors_from_image(img, AUTO_PARAMS)
-
-            # Si solo hay principal y se quiere secundario, permitir manual/swap después
             st.session_state["auto_state"] = {
-                "ready": True,
-                "c1": c1 or "",
-                "c2": c2 or "",
-                "n1": "",
-                "n2": "",
-                "foto_b64": file_to_b64(foto),
-                "categoria": categoria,
-                "tipo": tipo,
-                "hay_sec": bool(hay_secundario),
+                "ready": True, "c1": c1 or "", "c2": c2 or "",
+                "n1": "", "n2": "", "foto_b64": file_to_b64(foto_prenda),
+                "categoria": categoria, "tipo": tipo, "hay_sec": bool(hay_secundario),
+                "nombre_prenda": nombre_prenda, "estilo": estilo
             }
 
-    # Fase 2: si ya hay resultado (o si hubo uno previo)
     A = st.session_state["auto_state"]
     if A["ready"]:
-        st.markdown("### 🎯 Resultado de la detección")
-        c1_hex, c2_hex = A["c1"], A["c2"]
-        c1_name, c2_name = A["n1"], A["n2"]
-        hay_sec = A["hay_sec"]
+        st.markdown("#### 🎯 Resultado")
+        color1_hex, color2_hex = A["c1"], A["c2"]
+        color1_name, color2_name = A["n1"], A["n2"]
 
-        # Tres casos:
-        # A) Ambos distintos
-        if c1_hex and c2_hex and c1_hex.lower() != c2_hex.lower():
-            colA, colB = st.columns(2)
-            with colA: swatch_with_label(c1_hex, "Principal (auto)")
-            with colB:
-                if hay_sec:
-                    swatch_with_label(c2_hex, "Secundario (auto)")
-                else:
-                    st.info("No marcaste color secundario para esta prenda.")
-
-            if hay_sec:
-                ok = st.radio("¿Se ha detectado correctamente?", ["Sí", "No"], index=0, horizontal=True, key="auto_ok_both")
-            else:
-                ok = "Sí"
-
-            if ok == "No":
-                colx, coly = st.columns(2)
-                with colx:
-                    c1_hex = st.color_picker("Principal (HEX)", c1_hex, key="auto_adj_p")
-                    swatch_with_label(c1_hex, "Principal (ajustado)")
-                if hay_sec:
-                    with coly:
-                        c2_hex = st.color_picker("Secundario (HEX)", c2_hex, key="auto_adj_s")
-                        swatch_with_label(c2_hex, "Secundario (ajustado)")
-
-            st.markdown("**Nombres (opcionales)**")
-            n1c, n2c = st.columns(2)
-            with n1c:
-                c1_name = st.text_input("Nombre para principal", value=c1_name, key="auto_name_p")
-            if hay_sec:
-                with n2c:
-                    c2_name = st.text_input("Nombre para secundario", value=c2_name, key="auto_name_s")
-
-        # B) Solo principal detectado (o secundario igual)
-        elif c1_hex and (not c2_hex or c1_hex.lower() == c2_hex.lower()):
-            swatch_with_label(c1_hex, "Principal (auto)")
-
-            if hay_sec:
-                st.warning("No se detectó un color secundario distinto.")
-                swap = st.checkbox("El detectado como principal realmente es el SECUNDARIO; definir PRINCIPAL en HEX", key="auto_swap")
+        # Caso ambos
+        if color1_hex and color2_hex and color1_hex.lower()!=color2_hex.lower():
+            cA, cB = st.columns(2)
+            with cA: swatch(color1_hex, "principal (auto)")
+            with cB: swatch(color2_hex, "secundario (auto)")
+            ok = st.radio("¿Correcto?", ["Sí","No"], horizontal=True, key="auto_ok_both")
+            if ok=="No":
+                c1c, c2c = st.columns(2)
+                with c1c:
+                    color1_hex = st.color_picker("Principal (ajuste)", color1_hex, key="adj1")
+                with c2c:
+                    color2_hex = st.color_picker("Secundario (ajuste)", color2_hex, key="adj2")
+        # Solo principal o nada
+        elif color1_hex:
+            swatch(color1_hex, "principal (auto)")
+            if hay_secundario:
+                st.warning("No se detectó un secundario distinto.")
+                swap = st.checkbox("El detectado como principal es el SECUNDARIO; definir PRINCIPAL en hex")
                 if swap:
-                    c2_hex = c1_hex
-                    c1_hex = st.color_picker("Principal (HEX)", "#cccccc", key="auto_swap_p")
-                    cA, cB = st.columns(2)
-                    with cA: swatch_with_label(c1_hex, "Principal (definido)")
-                    with cB: swatch_with_label(c2_hex, "Secundario (auto)")
+                    color2_hex = color1_hex
+                    color1_hex = st.color_picker("Principal (hex)", "#3366cc", key="swaphex")
                 else:
-                    c2_hex = st.color_picker("Secundario (manual)", "#bbbbbb", key="auto_manual_sec")
-                    swatch_with_label(c2_hex, "Secundario (manual)")
-
-            st.markdown("**Nombres (opcionales)**")
-            n1c, n2c = st.columns(2)
-            with n1c:
-                c1_name = st.text_input("Nombre para principal", value=c1_name, key="auto_only_name_p")
-            if hay_sec:
-                with n2c:
-                    c2_name = st.text_input("Nombre para secundario", value=c2_name, key="auto_only_name_s")
-
-        # C) No se detectó nada
+                    color2_hex = st.color_picker("Secundario (manual hex)", "#bbbbbb", key="mansec")
+                    swatch(color2_hex, "secundario (manual)")
         else:
-            st.info("No se pudo detectar colores. Define por HEX:")
-            colx, coly = st.columns(2)
-            with colx:
-                c1_hex = st.color_picker("Principal (HEX)", "#cccccc", key="auto_fail_p")
-                swatch_with_label(c1_hex, "Principal")
-            if hay_sec:
-                with coly:
-                    c2_hex = st.color_picker("Secundario (HEX)", "#bbbbbb", key="auto_fail_s")
-                    swatch_with_label(c2_hex, "Secundario")
+            st.info("No se detectaron colores. Define por hex:")
+            c1c, c2c = st.columns(2)
+            with c1c:
+                color1_hex = st.color_picker("Principal (hex)", "#3366cc", key="fail1")
+            if hay_secundario:
+                with c2c:
+                    color2_hex = st.color_picker("Secundario (hex)", "#bbbbbb", key="fail2")
 
-            st.markdown("**Nombres (opcionales)**")
-            n1c, n2c = st.columns(2)
-            with n1c:
-                c1_name = st.text_input("Nombre para principal", value=c1_name, key="auto_fail_name_p")
-            if hay_sec:
-                with n2c:
-                    c2_name = st.text_input("Nombre para secundario", value=c2_name, key="auto_fail_name_s")
+        n1, n2 = st.columns(2)
+        with n1:
+            color1_name = st.text_input("Nombre color principal (opcional)", key="auto_name1")
+        if hay_secundario:
+            with n2:
+                color2_name = st.text_input("Nombre color secundario (opcional)", key="auto_name2")
 
-        # Validaciones + botón Añadir prenda (fase final)
+        # Validaciones
         errs = []
-        if not c1_hex: errs.append("Selecciona o define el color principal.")
-        if hay_sec and not c2_hex: errs.append("Has indicado color secundario: defínelo.")
-        if hay_sec and c1_hex and c2_hex and c1_hex.lower() == c2_hex.lower():
-            errs.append("El color secundario debe ser distinto del principal.")
+        if not color1_hex: errs.append("Debe haber color principal.")
+        if A["hay_sec"] and not color2_hex: errs.append("Has indicado secundario: defínelo.")
+        if A["hay_sec"] and color1_hex and color2_hex and color1_hex.lower()==color2_hex.lower():
+            errs.append("El secundario debe ser distinto al principal.")
+        st.session_state["auto_state"].update({"c1": color1_hex, "c2": color2_hex, "n1": color1_name, "n2": color2_name})
 
-        # Actualizar en estado antes de pulsar
-        st.session_state["auto_state"].update({"c1": c1_hex, "c2": c2_hex, "n1": c1_name, "n2": c2_name})
-
-        add = st.button("➕ Añadir prenda")
-        if add:
+        if st.button("➕ Añadir prenda"):
             if errs:
                 for e in errs: st.error(e)
             else:
                 nueva = pd.DataFrame([{
+                    "Id": str(uuid.uuid4()),
+                    "Nombre": A["nombre_prenda"] or nombre_prenda or f"Prenda {datetime.utcnow().strftime('%H%M%S')}",
                     "Categoria": A["categoria"] or categoria,
                     "Tipo": A["tipo"] or tipo,
-                    "Color1Hex": c1_hex, "Color1Name": c1_name,
-                    "Color2Hex": c2_hex if hay_sec else "", "Color2Name": c2_name if hay_sec else "",
+                    "Color1Hex": color1_hex,
+                    "Color1Name": color1_name,
+                    "Color2Hex": color2_hex if A["hay_sec"] else "",
+                    "Color2Name": color2_name if A["hay_sec"] else "",
+                    "Estilo": A["estilo"],
                     "FotoBase64": A["foto_b64"]
                 }], columns=COLUMNS)
                 st.session_state["armario"] = pd.concat([st.session_state["armario"], nueva], ignore_index=True)
                 st.success("Prenda añadida ✅")
-                # Reset de auto_state
-                st.session_state["auto_state"] = {
-                    "ready": False, "c1": "", "c2": "", "n1": "", "n2": "",
-                    "foto_b64": "", "categoria": "", "tipo": "", "hay_sec": False
-                }
+                st.session_state["auto_state"] = { "ready": False, "c1":"", "c2":"", "n1":"", "n2":"", "foto_b64":"", "categoria":"", "tipo":"", "hay_sec": False, "nombre_prenda":"", "estilo":ESTILOS[1] }
 
-# ---------------- Exportar / Importar XML ----------------
-st.subheader("💾 Guardar / Cargar tu armario (XML)")
-col1, col2 = st.columns(2)
+# Guardado directo (Paleta/Hex)
+if metodo in ["Paleta","Hex (picker)"]:
+    errs = []
+    if not nombre_prenda: errs.append("Pon un nombre a la prenda.")
+    if not color1_hex: errs.append("Selecciona color principal.")
+    if hay_secundario and color2_hex and color1_hex.lower()==color2_hex.lower():
+        errs.append("El secundario debe ser distinto al principal.")
+    if st.button("💾 Guardar prenda", type="primary"):
+        if errs:
+            for e in errs: st.error(e)
+        else:
+            nueva = pd.DataFrame([{
+                "Id": str(uuid.uuid4()),
+                "Nombre": nombre_prenda,
+                "Categoria": categoria,
+                "Tipo": tipo,
+                "Color1Hex": color1_hex, "Color1Name": color1_name,
+                "Color2Hex": color2_hex if hay_secundario else "", "Color2Name": color2_name if hay_secundario else "",
+                "Estilo": estilo,
+                "FotoBase64": file_to_b64(foto_prenda)
+            }], columns=COLUMNS)
+            st.session_state["armario"] = pd.concat([st.session_state["armario"], nueva], ignore_index=True)
+            st.success("Prenda guardada ✅")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Exportar / Importar armario (XML)
+# ──────────────────────────────────────────────────────────────────────────────
+st.subheader("💾 Guardar / Cargar armario (XML)")
+c1, c2 = st.columns(2)
 
 def df_to_xml_bytes(df: pd.DataFrame) -> bytes:
     root = Element("wardrobe", attrib={"version": SCHEMA_VERSION})
     for _, row in df.iterrows():
         item = SubElement(root, "item")
-        SubElement(item, "category").text = str(row["Categoria"])
-        SubElement(item, "type").text = str(row["Tipo"])
-        SubElement(item, "color1_hex").text = str(row.get("Color1Hex",""))
-        SubElement(item, "color1_name").text = str(row.get("Color1Name",""))
-        SubElement(item, "color2_hex").text = str(row.get("Color2Hex",""))
-        SubElement(item, "color2_name").text = str(row.get("Color2Name",""))
+        # Campos
+        SubElement(item, "id").text          = str(row.get("Id",""))
+        SubElement(item, "nombre").text      = str(row.get("Nombre",""))
+        SubElement(item, "categoria").text   = str(row.get("Categoria",""))
+        SubElement(item, "tipo").text        = str(row.get("Tipo",""))
+        SubElement(item, "color1hex").text   = str(row.get("Color1Hex",""))
+        SubElement(item, "color1name").text  = str(row.get("Color1Name",""))
+        SubElement(item, "color2hex").text   = str(row.get("Color2Hex",""))
+        SubElement(item, "color2name").text  = str(row.get("Color2Name",""))
+        SubElement(item, "estilo").text      = str(row.get("Estilo",""))
         if row.get("FotoBase64"):
-            SubElement(item, "photo_b64").text = row["FotoBase64"]
-    buf = io.BytesIO()
-    ElementTree(root).write(buf, encoding="utf-8", xml_declaration=True)
+            SubElement(item, "photo_b64").text = row.get("FotoBase64")
+    buf = io.BytesIO(); ElementTree(root).write(buf, encoding="utf-8", xml_declaration=True)
     return buf.getvalue()
 
 def xml_bytes_to_df(xml_bytes: bytes) -> pd.DataFrame:
     try:
-        root = fromstring(xml_bytes)
-        rows = []
-        for item in root.findall("item"):
+        root = fromstring(xml_bytes); rows = []
+        for it in root.findall("item"):
             rows.append({
-                "Categoria": item.findtext("category",""),
-                "Tipo": item.findtext("type",""),
-                "Color1Hex": item.findtext("color1_hex",""),
-                "Color1Name": item.findtext("color1_name",""),
-                "Color2Hex": item.findtext("color2_hex",""),
-                "Color2Name": item.findtext("color2_name",""),
-                "FotoBase64": item.findtext("photo_b64","") or "",
+                "Id": it.findtext("id","") or str(uuid.uuid4()),
+                "Nombre": it.findtext("nombre",""),
+                "Categoria": it.findtext("categoria",""),
+                "Tipo": it.findtext("tipo",""),
+                "Color1Hex": it.findtext("color1hex",""),
+                "Color1Name": it.findtext("color1name",""),
+                "Color2Hex": it.findtext("color2hex",""),
+                "Color2Name": it.findtext("color2name",""),
+                "Estilo": it.findtext("estilo",""),
+                "FotoBase64": it.findtext("photo_b64","") or ""
             })
         return pd.DataFrame(rows, columns=COLUMNS)
     except Exception as e:
         st.error(f"XML no válido: {e}")
         return pd.DataFrame(columns=COLUMNS)
 
-with col1:
+with c1:
     if not st.session_state["armario"].empty:
-        xml_bytes = df_to_xml_bytes(st.session_state["armario"])
-        fname = f"armario_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}Z.xml"
-        st.download_button("⬇️ Descargar XML", data=xml_bytes, file_name=fname, mime="application/xml")
+        st.download_button(
+            "⬇️ Descargar XML",
+            data=df_to_xml_bytes(st.session_state["armario"]),
+            file_name=f"armario_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}Z.xml",
+            mime="application/xml"
+        )
     else:
-        st.info("Añade prendas para poder descargar tu XML.")
+        st.info("Añade prendas para poder descargar tu armario.")
 
-with col2:
+with c2:
     up = st.file_uploader("⬆️ Cargar XML", type=["xml"])
-    modo = st.radio("Cómo cargar", ["Añadir a lo existente", "Reemplazar todo"], horizontal=True)
+    modo = st.radio("Cómo cargar", ["Añadir", "Reemplazar"], horizontal=True)
     if up is not None:
         df_imp = xml_bytes_to_df(up.read())
         if not df_imp.empty:
-            if modo == "Reemplazar todo":
-                st.session_state["armario"] = df_imp
-            else:
-                st.session_state["armario"] = pd.concat([st.session_state["armario"], df_imp], ignore_index=True)
-            st.success("XML cargado correctamente ✅")
+            if modo == "Reemplazar": st.session_state["armario"] = df_imp
+            else: st.session_state["armario"] = pd.concat([st.session_state["armario"], df_imp], ignore_index=True)
+            st.success("XML cargado ✅")
 
-# ---------------- Vista ----------------
-st.subheader("🗂 Tu Armario")
+# ──────────────────────────────────────────────────────────────────────────────
+# OUTFITS (Sidebar)
+# ──────────────────────────────────────────────────────────────────────────────
+st.sidebar.header("👗 Crear / Usar outfit")
+
+def filter_prendas_for_weather(df, tmin, tmax, season, elegance):
+    """Filtro por temp/estación/elegancia; en formal se excluye neón."""
+    df = df.copy()
+
+    # Largo vs corto por clima
+    if tmax >= 23:  # caluroso
+        df = df[~((df["Categoria"].isin(["Pantalón"])) & (df["Tipo"]=="Largo"))]
+        df = df[~(df["Categoria"].isin(["Botas"]))]  # menos botas
+    if tmax <= 12:  # frío
+        df = df[~(df["Categoria"].isin(["Short","Falda","Sandalias"]))]
+
+    # Elegancia aproximada por estilo (1 chándal, 2 casual, 3-4 formal)
+    estilo_rank = {"Chándal":1, "Casual":2, "Formal":4}
+    df["ElegScore"] = df["Estilo"].map(estilo_rank).fillna(2)
+
+    # En formal (elegancia >=4) no permitimos fosforitos/neón
+    if elegance >= 4:
+        mask_neon = (df["Color1Hex"].apply(is_neon)) | (df["Color2Hex"].apply(is_neon))
+        df = df[~mask_neon]
+
+    # Tolerancia de ±1 en elegancia
+    df = df[np.abs(df["ElegScore"] - elegance) <= 1]
+    return df
+
+def load_guide():
+    return GUIDE
+
+def hex_to_family_local(h):
+    return hex_to_family(h)
+
+def colors_compatible_local(a,b):
+    return colors_compatible(a,b)
+
+def pick_by_color(top_hex, candidates_hex):
+    """Elige candidatos compatibles; si no hay, devuelve todos."""
+    compatible = [h for h in candidates_hex if colors_compatible_local(top_hex, h)]
+    return compatible if compatible else candidates_hex
+
+def auto_build_outfit(df, tmin, tmax, season, elegance):
+    dfw = filter_prendas_for_weather(df, tmin, tmax, season, elegance)
+    if dfw.empty: return None
+
+    tops    = dfw[dfw["Categoria"].isin(["Camiseta","Camisa","Sudadera"])]
+    bottoms = dfw[dfw["Categoria"].isin(["Pantalón","Short","Falda"])]
+    shoes   = dfw[dfw["Categoria"].isin(["Zapatillas","Botas","Sandalias"])]
+
+    if tops.empty or bottoms.empty or shoes.empty:
+        return None
+
+    # preferencia por largo si hace frío
+    if tmax <= 16 and not tops[tops["Tipo"]=="Largo"].empty:
+        top = tops[tops["Tipo"]=="Largo"].sample(1)
+    else:
+        top = tops.sample(1)
+    top_hex = top.iloc[0]["Color1Hex"] or top.iloc[0]["Color2Hex"]
+
+    bottom_pool = bottoms.copy()
+    b_hexs = (bottom_pool["Color1Hex"].replace("", pd.NA).fillna(bottom_pool["Color2Hex"])).tolist()
+    good_b = pick_by_color(top_hex, b_hexs)
+    if not good_b:
+        bottom = bottoms.sample(1)
+    else:
+        bottom = bottom_pool.iloc[[b_hexs.index(np.random.choice(good_b))]]
+
+    # zapatos por clima
+    if tmax >= 25 and not shoes[shoes["Categoria"]=="Sandalias"].empty:
+        shoe_pool = shoes[shoes["Categoria"]=="Sandalias"]
+    elif tmax <= 12 and not shoes[shoes["Categoria"]=="Botas"].empty:
+        shoe_pool = shoes[shoes["Categoria"]=="Botas"]
+    else:
+        shoe_pool = shoes
+    shoes_hexs = (shoe_pool["Color1Hex"].replace("", pd.NA).fillna(shoe_pool["Color2Hex"])).tolist()
+    good_s = pick_by_color(top_hex, shoes_hexs)
+    if not good_s:
+        shoe = shoe_pool.sample(1)
+    else:
+        shoe = shoe_pool.iloc[[shoes_hexs.index(np.random.choice(good_s))]]
+
+    outfit_ids = [top.iloc[0]["Id"], bottom.iloc[0]["Id"], shoe.iloc[0]["Id"]]
+    return outfit_ids
+
+# Crear outfit manual
+with st.sidebar.expander("✍️ Crear outfit manual", expanded=False):
+    if st.session_state["armario"].empty:
+        st.info("Añade prendas primero.")
+    else:
+        name = st.text_input("Nombre del outfit", key="out_name_manual")
+        tmin = st.number_input("Temp. mínima", value=12, step=1)
+        tmax = st.number_input("Temp. máxima", value=22, step=1)
+        seas = st.multiselect("Estaciones", SEASONS, default=["Primavera","Otoño"])
+        eleg = st.slider("Elegancia (1 poco · 5 mucho)", 1, 5, 3)
+        df = st.session_state["armario"]
+
+        # aviso si formal y hay neón
+        warn_neon = False
+        ids = st.multiselect("Prendas (por nombre)", df["Nombre"].tolist())
+        chosen = df[df["Nombre"].isin(ids)]
+        if eleg >= 4 and not chosen.empty:
+            neon_mask = (chosen["Color1Hex"].apply(is_neon)) | (chosen["Color2Hex"].apply(is_neon))
+            if neon_mask.any():
+                warn_neon = True
+        if warn_neon:
+            st.warning("Has seleccionado colores tipo neón. No se recomiendan para un outfit **Formal**.")
+
+        if st.button("Guardar outfit manual"):
+            chosen_ids = chosen["Id"].tolist()
+            if not name or not chosen_ids:
+                st.error("Pon nombre y elige al menos una prenda.")
+            else:
+                st.session_state["outfits"].append({
+                    "id": str(uuid.uuid4()), "name": name,
+                    "item_ids": chosen_ids, "temp_min": int(tmin), "temp_max": int(tmax),
+                    "seasons": seas, "elegance": int(eleg)
+                })
+                st.success("Outfit guardado ✅")
+
+# Crear outfit automático
+with st.sidebar.expander("🤖 Crear outfit automático", expanded=True):
+    if st.session_state["armario"].empty:
+        st.info("Añade prendas primero.")
+    else:
+        tmin = st.number_input("Temp. mínima", value=12, step=1, key="at_min")
+        tmax = st.number_input("Temp. máxima", value=22, step=1, key="at_max")
+        season = st.selectbox("Estación", SEASONS, index=1, key="at_season")
+        eleg = st.slider("Elegancia (1-5)", 1, 5, 3, key="at_eleg")
+        if st.button("Sugerir outfit"):
+            ids = auto_build_outfit(st.session_state["armario"], tmin, tmax, season, eleg)
+            if not ids:
+                st.warning("No he podido sugerir con tus filtros. Relaja condiciones o añade más prendas.")
+            else:
+                st.success("Sugerencia creada 👇")
+                st.session_state["last_suggest"] = ids
+
+        if "last_suggest" in st.session_state:
+            ids = st.session_state["last_suggest"]
+            df = st.session_state["armario"].set_index("Id")
+            st.write("**Propuesta:**")
+            for pid in ids:
+                row = df.loc[pid]
+                sw = row["Color1Hex"] or row["Color2Hex"]
+                st.write(f"- {row['Nombre']} · {row['Categoria']} ({row['Tipo']}) · {row['Estilo']}")
+                swatch(sw)
+            name = st.text_input("Nombre para guardar", key="at_name_save")
+            if st.button("Guardar esta propuesta"):
+                if not name:
+                    st.error("Pon un nombre para el outfit.")
+                else:
+                    st.session_state["outfits"].append({
+                        "id": str(uuid.uuid4()), "name": name,
+                        "item_ids": ids, "temp_min": int(st.session_state["at_min"]),
+                        "temp_max": int(st.session_state["at_max"]), "seasons": [st.session_state["at_season"]],
+                        "elegance": int(st.session_state["at_eleg"])
+                    })
+                    st.success("Outfit guardado ✅")
+
+# Usar outfit guardado
+with st.sidebar.expander("📚 Usar outfit guardado", expanded=False):
+    if not st.session_state["outfits"]:
+        st.info("Aún no hay outfits guardados.")
+    else:
+        tmin = st.number_input("Temp. mínima", value=12, step=1, key="use_min")
+        tmax = st.number_input("Temp. máxima", value=22, step=1, key="use_max")
+        season = st.selectbox("Estación", SEASONS, index=1, key="use_season")
+        eleg = st.slider("Elegancia (1-5)", 1, 5, 3, key="use_eleg")
+        candidates = [
+            o for o in st.session_state["outfits"]
+            if o["temp_min"] <= tmin and o["temp_max"] >= tmax
+               and season in o["seasons"] and abs(o["elegance"]-eleg)<=1
+        ]
+        names = [o["name"] for o in candidates]
+        pick = st.selectbox("Outfit", names) if names else None
+        if pick:
+            o = next(x for x in candidates if x["name"]==pick)
+            st.write("**Outfit elegido:**")
+            df = st.session_state["armario"].set_index("Id")
+            for pid in o["item_ids"]:
+                if pid in df.index:
+                    row = df.loc[pid]
+                    st.write(f"- {row['Nombre']} · {row['Categoria']} ({row['Tipo']}) · {row['Estilo']}")
+                    swatch(row["Color1Hex"] or row["Color2Hex"])
+
+# Exportar/Importar outfits
+st.sidebar.markdown("---")
+st.sidebar.subheader("💾 Outfits (exportar/importar)")
+def outfits_to_bytes(outfits: list) -> bytes:
+    return json.dumps(outfits, ensure_ascii=False, indent=2).encode("utf-8")
+
+def outfits_from_bytes(b: bytes) -> list:
+    try:
+        return json.loads(b.decode("utf-8"))
+    except Exception:
+        return []
+
+st.sidebar.download_button(
+    "⬇️ Exportar outfits (.json)",
+    data=outfits_to_bytes(st.session_state["outfits"]),
+    file_name="outfits.json",
+    mime="application/json"
+)
+imp = st.sidebar.file_uploader("⬆️ Importar outfits", type=["json"])
+if imp is not None:
+    data = outfits_from_bytes(imp.read())
+    if isinstance(data, list):
+        st.session_state["outfits"] = data
+        st.sidebar.success("Outfits importados ✅")
+    else:
+        st.sidebar.error("Archivo JSON no válido.")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Vista del armario
+# ──────────────────────────────────────────────────────────────────────────────
+st.markdown("## 🗂 Tu Armario")
 if st.session_state["armario"].empty:
     st.info("Aún no has añadido ninguna prenda.")
 else:
-    f1, f2 = st.columns(2)
+    f1, f2, f3 = st.columns(3)
     with f1:
         f_cat = st.selectbox("Filtrar por categoría", ["Todos"] + sorted(st.session_state["armario"]["Categoria"].unique().tolist()))
     with f2:
         f_tipo = st.selectbox("Filtrar por tipo", ["Todos"] + sorted(st.session_state["armario"]["Tipo"].unique().tolist()))
+    with f3:
+        f_est = st.selectbox("Filtrar por estilo", ["Todos"] + ESTILOS)
 
     df = st.session_state["armario"].copy()
-    if f_cat != "Todos":
-        df = df[df["Categoria"] == f_cat]
-    if f_tipo != "Todos":
-        df = df[df["Tipo"] == f_tipo]
+    if f_cat != "Todos": df = df[df["Categoria"] == f_cat]
+    if f_tipo != "Todos": df = df[df["Tipo"] == f_tipo]
+    if f_est != "Todos": df = df[df["Estilo"] == f_est]
 
     st.dataframe(df.drop(columns=["FotoBase64"]), use_container_width=True)
 
@@ -568,6 +739,6 @@ else:
                 with cols[i % 6]:
                     st.image(
                         img_bytes,
-                        caption=f"{row['Categoria']} ({row['Color1Hex']}" + (f", {row['Color2Hex']}" if row['Color2Hex'] else "") + ")",
+                        caption=f"{row['Nombre']} ({row['Color1Hex']}" + (f", {row['Color2Hex']}" if row['Color2Hex'] else "") + ")",
                         use_container_width=True
                     )
