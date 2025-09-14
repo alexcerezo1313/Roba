@@ -3,4 +3,3 @@ supabase
 pandas
 pillow
 numpy
-
