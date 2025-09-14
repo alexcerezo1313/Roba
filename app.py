@@ -5,40 +5,35 @@ from datetime import datetime
 import base64, io
 from PIL import Image
 import numpy as np
-from streamlit_cropper import st_cropper
 
-st.set_page_config(page_title="👕 Armario Digital", page_icon="🧥", layout="wide")
+st.set_page_config(page_title="👕 Armario Digital — Auto colores", page_icon="🧥", layout="wide")
 
-# ---------- Config ----------
-COLUMNS = ["Categoria", "Tipo", "Color1Nombre", "Color1Hex", "Color2Nombre", "Color2Hex", "FotoBase64"]
-SCHEMA_VERSION = "8.0"
-
-CATEGORIAS = [
-    "Camiseta", "Camisa", "Sudadera",
-    "Pantalón", "Short", "Falda",
-    "Zapatillas", "Botas", "Sandalias"
-]
+# ---------------- Config ----------------
+CATEGORIAS = ["Camiseta", "Camisa", "Sudadera", "Pantalón", "Short", "Falda", "Zapatillas", "Botas", "Sandalias"]
 TIPOS = ["Corto", "Largo"]
+COLUMNS = ["Categoria", "Tipo", "Color1Hex", "Color2Hex", "FotoBase64"]
+SCHEMA_VERSION = "10.1"
 
-PALETA = {
-    "Negro": "#000000",
-    "Blanco": "#FFFFFF",
-    "Gris": "#808080",
-    "Beige": "#F5F5DC",
-    "Marrón": "#8B4513",
-    "Azul marino": "#000080",
-    "Azul claro": "#87CEEB",
-    "Rojo": "#FF0000",
-    "Verde": "#008000",
-    "Amarillo": "#FFFF00",
-    "Rosa": "#FFC0CB"
-}
+# Parámetros AUTOMÁTICOS optimizados para 1 prenda por foto
+AUTO_PARAMS = dict(
+    center_keep=0.95,          # Mantener 95% central
+    ignore_bg_mode="auto",     # Ignorar fondo claro/oscuro automáticamente
+    exclude_skin=False,        # No hace falta si la foto es solo la prenda
+    exclude_border=True,       # Excluir color parecido a los bordes (fondo)
+    sat_min=0.12,              # Saturación mínima
+    val_min=0.12,              # Brillo mínimo
+    val_max=0.98,              # Brillo máximo
+    border_sim_thresh=0.18,    # Tolerancia similitud a bordes (HSV)
+    k_palette=7,               # Tamaño paleta para cuantización
+    min_dist=0.28,             # Separación mínima entre principal/secundario (HSV)
+    min_prop_secondary=0.10,   # Proporción mínima del secundario
+    user_bg_hex=None           # Sin color de fondo explícito
+)
 
-# ---------- Estado ----------
 if "armario" not in st.session_state:
     st.session_state["armario"] = pd.DataFrame(columns=COLUMNS)
 
-# ---------- Utils ----------
+# ---------------- Utils básicos ----------------
 def file_to_b64(uploaded_file) -> str:
     if uploaded_file is None:
         return ""
@@ -50,31 +45,312 @@ def b64_to_bytes(b64: str) -> bytes:
     except Exception:
         return b""
 
-def hex_from_rgb(rgb_tuple) -> str:
-    r, g, b = rgb_tuple[:3]
+def hex_from_rgb(rgb):
+    r, g, b = [int(x) for x in rgb[:3]]
     return f"#{r:02X}{g:02X}{b:02X}"
 
-def color_preview(hex_code: str):
+def rgb_to_hsv_vec(rgb_arr_uint8: np.ndarray) -> np.ndarray:
+    """RGB [0..255] -> HSV [0..1]. rgb_arr_uint8 shape: (N,3) uint8."""
+    rgb = rgb_arr_uint8.astype(np.float32) / 255.0
+    r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    mx = np.max(rgb, axis=1)
+    mn = np.min(rgb, axis=1)
+    diff = mx - mn
+
+    # Hue
+    h = np.zeros_like(mx)
+    mask_r = (mx == r) & (diff != 0)
+    mask_g = (mx == g) & (diff != 0)
+    mask_b = (mx == b) & (diff != 0)
+    h[mask_r] = ((g[mask_r] - b[mask_r]) / diff[mask_r]) % 6
+    h[mask_g] = (b[mask_g] - r[mask_g]) / diff[mask_g] + 2
+    h[mask_b] = (r[mask_b] - g[mask_b]) / diff[mask_b] + 4
+    h = (h / 6.0) % 1.0
+
+    # Saturation & Value
+    s = np.zeros_like(mx)
+    s[mx != 0] = diff[mx != 0] / mx[mx != 0]
+    v = mx
+    return np.stack([h, s, v], axis=1)  # (N,3)
+
+def color_distance_hsv(c1_rgb, c2_rgb):
+    """Distancia en HSV perceptual aproximada (0..~2)."""
+    def single(rgb):
+        arr = np.array(rgb, dtype=np.uint8).reshape(1, 3)
+        return rgb_to_hsv_vec(arr)[0]
+    h1, s1, v1 = single(c1_rgb)
+    h2, s2, v2 = single(c2_rgb)
+    dh = min(abs(h1 - h2), 1 - abs(h1 - h2)) * 2.0
+    ds = abs(s1 - s2)
+    dv = abs(v1 - v2)
+    return dh * 0.6 + ds * 0.8 + dv * 0.4
+
+def rgb_to_ycrcb_vec(rgb_arr_uint8: np.ndarray) -> np.ndarray:
+    """Convierte RGB a YCrCb aprox (BT.601). shape: (N,3) -> (N,3) en rango 0..255"""
+    R = rgb_arr_uint8[:, 0].astype(np.float32)
+    G = rgb_arr_uint8[:, 1].astype(np.float32)
+    B = rgb_arr_uint8[:, 2].astype(np.float32)
+    Y  =  0.299*R + 0.587*G + 0.114*B
+    Cb = 128 - 0.168736*R - 0.331264*G + 0.5*B
+    Cr = 128 + 0.5*R - 0.418688*G - 0.081312*B
+    out = np.stack([Y, Cr, Cb], axis=1)
+    out = np.clip(out, 0, 255)
+    return out
+
+def skin_mask(rgb_arr_uint8: np.ndarray) -> np.ndarray:
+    """Máscara de piel aproximada en YCrCb (umbral clásico). True donde ES piel."""
+    ycrcb = rgb_to_ycrcb_vec(rgb_arr_uint8)
+    Cr = ycrcb[:, 1]
+    Cb = ycrcb[:, 2]
+    return (Cr >= 133) & (Cr <= 173) & (Cb >= 77) & (Cb <= 127)
+
+def quantize_colors(arr_rgb_uint8: np.ndarray, k=6):
+    """Cuantiza con Pillow (MEDIANCUT) y devuelve [(count, (r,g,b)), ...] desc."""
+    if arr_rgb_uint8.size == 0:
+        return []
+    n = arr_rgb_uint8.shape[0]
+    w = int(np.ceil(np.sqrt(n)))
+    h = int(np.ceil(n / w))
+    pad = w * h - n
+    if pad > 0:
+        arr_rgb_uint8 = np.vstack([arr_rgb_uint8, np.tile(arr_rgb_uint8[-1], (pad, 1))])
+    img = Image.fromarray(arr_rgb_uint8.reshape(h, w, 3), mode="RGB")
+    q = img.quantize(colors=max(2, k), method=Image.MEDIANCUT)
+    pal = q.getpalette()[:k*3]
+    counts = q.getcolors() or []
+    results = []
+    for count, idx in counts:
+        r, g, b = pal[idx*3:idx*3+3]
+        results.append((int(count), (int(r), int(g), int(b))))
+    results.sort(key=lambda t: t[0], reverse=True)
+    return results
+
+def estimate_border_colors(arr_rgb_uint8: np.ndarray, width: int, height: int, border_frac: float = 0.06):
+    """Promedios de color en los 4 bordes para excluir fondo similar."""
+    bf = max(1, int(min(width, height) * border_frac))
+    img2d = arr_rgb_uint8.reshape(height, width, 3)
+    top = img2d[:bf, :, :].reshape(-1, 3).mean(0)
+    bottom = img2d[-bf:, :, :].reshape(-1, 3).mean(0)
+    left = img2d[:, :bf, :].reshape(-1, 3).mean(0)
+    right = img2d[:, -bf:, :].reshape(-1, 3).mean(0)
+    L = [tuple(int(x) for x in top), tuple(int(x) for x in bottom), tuple(int(x) for x in left), tuple(int(x) for x in right)]
+    return L
+
+def auto_colors_from_image(
+    image: Image.Image,
+    center_keep: float = AUTO_PARAMS["center_keep"],
+    sat_min: float = AUTO_PARAMS["sat_min"],
+    val_min: float = AUTO_PARAMS["val_min"],
+    val_max: float = AUTO_PARAMS["val_max"],
+    ignore_bg_mode: str = AUTO_PARAMS["ignore_bg_mode"],  # "auto" | "ninguno" | "claro" | "oscuro"
+    exclude_skin: bool = AUTO_PARAMS["exclude_skin"],
+    exclude_border: bool = AUTO_PARAMS["exclude_border"],
+    border_sim_thresh: float = AUTO_PARAMS["border_sim_thresh"],
+    k_palette: int = AUTO_PARAMS["k_palette"],
+    min_dist: float = AUTO_PARAMS["min_dist"],
+    min_prop_secondary: float = AUTO_PARAMS["min_prop_secondary"],
+    user_bg_hex: str | None = AUTO_PARAMS["user_bg_hex"]
+):
+    """
+    Devuelve (c1_hex, c2_hex, meta_dict) totalmente AUTOMÁTICO.
+    Pensado para 1 prenda centrada en la foto.
+    """
+    # --- Preproceso y reducción ---
+    img = image.convert("RGB")
+    w0, h0 = img.size
+    scale = min(640 / max(w0, h0), 1.0)
+    if scale < 1.0:
+        img = img.resize((int(w0*scale), int(h0*scale)), Image.LANCZOS)
+    w, h = img.size
+    arr = np.array(img)                  # (H, W, 3)
+    flat = arr.reshape(-1, 3).astype(np.uint8)
+
+    # --- Región central ---
+    mask = np.ones((h, w), dtype=bool)
+    if center_keep < 1.0:
+        keep_w = int(w * center_keep)
+        keep_h = int(h * center_keep)
+        x0 = (w - keep_w) // 2
+        y0 = (h - keep_h) // 2
+        central = np.zeros_like(mask)
+        central[y0:y0+keep_h, x0:x0+keep_w] = True
+        mask &= central
+
+    # --- HSV filtros básicos ---
+    hsv = rgb_to_hsv_vec(flat)  # (N,3)
+    hsv2d = hsv.reshape(h, w, 3)
+    mask &= (hsv2d[:, :, 1] >= sat_min) & (hsv2d[:, :, 2] >= val_min) & (hsv2d[:, :, 2] <= val_max)
+
+    # --- Modo fondo ---
+    if ignore_bg_mode == "auto":
+        # quitar blancos/grises muy claros y negro profundo
+        mask &= ~((hsv2d[:, :, 2] > 0.92) & (hsv2d[:, :, 1] < 0.20))
+        mask &= ~(hsv2d[:, :, 2] < 0.08)
+    elif ignore_bg_mode == "claro":
+        mask &= ~((hsv2d[:, :, 2] > 0.90) & (hsv2d[:, :, 1] < 0.25))
+    elif ignore_bg_mode == "oscuro":
+        mask &= ~(hsv2d[:, :, 2] < 0.12)
+
+    # --- Excluir tono piel (por si hay mano sujetando) ---
+    if exclude_skin:
+        skin2d = skin_mask(flat).reshape(h, w)
+        mask &= ~skin2d
+
+    # --- Excluir colores similares a los bordes (fondo) ---
+    border_rgbs = []
+    if exclude_border:
+        border_rgbs = estimate_border_colors(flat, width=w, height=h, border_frac=0.06)
+        hsv_all = hsv  # ya calculado
+        for bg in border_rgbs:
+            hsv_bg = rgb_to_hsv_vec(np.array([bg], dtype=np.uint8))[0]
+            dh = np.minimum(np.abs(hsv_all[:, 0] - hsv_bg[0]), 1 - np.abs(hsv_all[:, 0] - hsv_bg[0])) * 2.0
+            ds = np.abs(hsv_all[:, 1] - hsv_bg[1])
+            dv = np.abs(hsv_all[:, 2] - hsv_bg[2])
+            dist = dh * 0.6 + ds * 0.8 + dv * 0.4
+            mask &= (dist.reshape(h, w) > border_sim_thresh)
+
+    # --- Excluir color de fondo proporcionado (aquí None por defecto) ---
+    if user_bg_hex:
+        bg = tuple(int(user_bg_hex[i:i+2], 16) for i in (1, 3, 5))
+        hsv_bg = rgb_to_hsv_vec(np.array([bg], dtype=np.uint8))[0]
+        dh = np.minimum(np.abs(hsv[:, 0] - hsv_bg[0]), 1 - np.abs(hsv[:, 0] - hsv_bg[0])) * 2.0
+        ds = np.abs(hsv[:, 1] - hsv_bg[1])
+        dv = np.abs(hsv[:, 2] - hsv_bg[2])
+        dist = dh * 0.6 + ds * 0.8 + dv * 0.4
+        mask &= (dist.reshape(h, w) > 0.14)
+
+    # --- Salvaguarda: si queda muy poco, relajamos a solo región central ---
+    if mask.sum() < (h * w * 0.02):  # <2%
+        mask = np.ones((h, w), dtype=bool)
+        if center_keep < 1.0:
+            keep_w = int(w * center_keep)
+            keep_h = int(h * center_keep)
+            x0 = (w - keep_w) // 2
+            y0 = (h - keep_h) // 2
+            central = np.zeros_like(mask)
+            central[y0:y0+keep_h, x0:x0+keep_w] = True
+            mask &= central
+
+    selected = flat[mask.reshape(-1)]
+    if selected.size == 0:
+        return None, None, {
+            "pixels_used": 0,
+            "border_samples": [hex_from_rgb(c) for c in border_rgbs],
+            "palette": []
+        }
+
+    # --- Cuantización y elección principal/secundario ---
+    k_eff = int(np.clip(np.sqrt(selected.shape[0] / 300), 3, k_palette))
+    pal = quantize_colors(selected, k=k_eff)  # [(count, (r,g,b)), ...]
+    total = sum(c for c, _ in pal) if pal else 1
+    palette_hex = [(cnt, hex_from_rgb(rgb), round(cnt/total, 3)) for cnt, rgb in pal]
+
+    c1 = None
+    c2 = None
+    if pal:
+        c1 = pal[0][1]
+        for cnt, rgb in pal[1:]:
+            prop = cnt / total
+            if prop >= min_prop_secondary and color_distance_hsv(c1, rgb) >= min_dist:
+                c2 = rgb
+                break
+
+    return (
+        hex_from_rgb(c1) if c1 else None,
+        hex_from_rgb(c2) if c2 else None,
+        {
+            "pixels_used": int(selected.shape[0]),
+            "border_samples": [hex_from_rgb(c) for c in border_rgbs],
+            "palette": palette_hex
+        }
+    )
+
+def swatch(hex_code, label=None):
     if not hex_code:
         return
+    lab = f"&nbsp;{label}" if label else ""
     st.markdown(
-        f"<div style='background:{hex_code};width:100%;height:26px;border:1px solid #000;border-radius:6px;'></div>",
-        unsafe_allow_html=True
+        f"<div style='display:flex;align-items:center;gap:8px;'>"
+        f"<div style='width:28px;height:28px;border-radius:6px;border:1px solid #000;background:{hex_code};'></div>"
+        f"<code>{hex_code}</code>{lab}"
+        f"</div>", unsafe_allow_html=True
     )
+
+# ---------------- UI: Crear prenda ----------------
+st.title("👕 Armario Digital — Detección automática de colores")
+st.caption("Sube una foto de **una única prenda**. Detectamos color principal y, si existe, un secundario. Todo automático.")
+
+with st.form("nueva_prenda", clear_on_submit=False):
+    left, right = st.columns([1, 1])
+
+    with left:
+        categoria = st.selectbox("Categoría", CATEGORIAS)
+        tipo = st.selectbox("Tipo", TIPOS)
+
+        foto_color = st.file_uploader("📸 Foto para detectar colores", type=["png","jpg","jpeg"], key="foto_color")
+        c1_hex = c2_hex = ""
+        meta = {}
+
+        if foto_color is not None:
+            img = Image.open(io.BytesIO(foto_color.getvalue()))
+            st.image(img, caption="Imagen cargada", use_container_width=True)
+
+            # --- AUTO detección con parámetros fijos ---
+            c1_hex, c2_hex, meta = auto_colors_from_image(img)
+
+            st.markdown("### 🎯 Colores detectados (automático)")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("**Principal**")
+                if c1_hex:
+                    swatch(c1_hex, "(auto)")
+                else:
+                    st.info("No se pudo determinar color principal.")
+            with col_b:
+                st.markdown("**Secundario**")
+                if c2_hex:
+                    swatch(c2_hex, "(auto)")
+                else:
+                    st.info("No hay color secundario claro (o la prenda es monocolor).")
+
+            with st.expander("Ver detalles de paleta (opcional)"):
+                st.write("Muestras de color en bordes:", meta.get("border_samples"))
+                st.write("Paleta (count, hex, proporción):", meta.get("palette"))
+                st.caption(f"Píxeles usados tras filtros: {meta.get('pixels_used', 0)}")
+
+        # Sin ajuste manual: totalmente automático
+
+    with right:
+        foto_prenda = st.file_uploader("📦 Foto de la prenda a guardar (opcional)", type=["png","jpg","jpeg"], key="foto_prenda")
+        if foto_prenda:
+            st.image(foto_prenda, caption="Vista previa prenda", use_container_width=True)
+
+    enviado = st.form_submit_button("➕ Añadir prenda")
+    if enviado:
+        nueva = pd.DataFrame([{
+            "Categoria": categoria,
+            "Tipo": tipo,
+            "Color1Hex": c1_hex or "",
+            "Color2Hex": c2_hex or "",
+            "FotoBase64": file_to_b64(foto_prenda)
+        }], columns=COLUMNS)
+        st.session_state["armario"] = pd.concat([st.session_state["armario"], nueva], ignore_index=True)
+        st.success(f"{categoria} añadida ✅")
+
+# ---------------- Exportar / Importar XML ----------------
+st.subheader("💾 Guardar / Cargar tu armario (XML)")
+col1, col2 = st.columns(2)
 
 def df_to_xml_bytes(df: pd.DataFrame) -> bytes:
     root = Element("wardrobe", attrib={"version": SCHEMA_VERSION})
     for _, row in df.iterrows():
         item = SubElement(root, "item")
-        SubElement(item, "category").text = str(row.get("Categoria", ""))
-        SubElement(item, "type").text = str(row.get("Tipo", ""))
-        SubElement(item, "color1_name").text = str(row.get("Color1Nombre", ""))
-        SubElement(item, "color1_hex").text = str(row.get("Color1Hex", ""))
-        SubElement(item, "color2_name").text = str(row.get("Color2Nombre", ""))
-        SubElement(item, "color2_hex").text = str(row.get("Color2Hex", ""))
-        foto_b64 = (row.get("FotoBase64") or "").strip()
-        if foto_b64:
-            SubElement(item, "photo_b64").text = foto_b64
+        SubElement(item, "category").text = str(row["Categoria"])
+        SubElement(item, "type").text = str(row["Tipo"])
+        SubElement(item, "color1_hex").text = str(row.get("Color1Hex",""))
+        SubElement(item, "color2_hex").text = str(row.get("Color2Hex",""))
+        if row.get("FotoBase64"):
+            SubElement(item, "photo_b64").text = row["FotoBase64"]
     buf = io.BytesIO()
     ElementTree(root).write(buf, encoding="utf-8", xml_declaration=True)
     return buf.getvalue()
@@ -82,171 +358,21 @@ def df_to_xml_bytes(df: pd.DataFrame) -> bytes:
 def xml_bytes_to_df(xml_bytes: bytes) -> pd.DataFrame:
     try:
         root = fromstring(xml_bytes)
-        records = []
+        rows = []
         for item in root.findall("item"):
-            records.append({
-                "Categoria": (item.findtext("category") or "").strip(),
-                "Tipo": (item.findtext("type") or "").strip(),
-                "Color1Nombre": (item.findtext("color1_name") or "").strip(),
-                "Color1Hex": (item.findtext("color1_hex") or "").strip(),
-                "Color2Nombre": (item.findtext("color2_name") or "").strip(),
-                "Color2Hex": (item.findtext("color2_hex") or "").strip(),
-                "FotoBase64": (item.findtext("photo_b64") or "").strip(),
+            rows.append({
+                "Categoria": item.findtext("category",""),
+                "Tipo": item.findtext("type",""),
+                "Color1Hex": item.findtext("color1_hex",""),
+                "Color2Hex": item.findtext("color2_hex",""),
+                "FotoBase64": item.findtext("photo_b64","") or "",
             })
-        return pd.DataFrame(records, columns=COLUMNS)
+        return pd.DataFrame(rows, columns=COLUMNS)
     except Exception as e:
         st.error(f"XML no válido: {e}")
         return pd.DataFrame(columns=COLUMNS)
 
-def dominant_or_mean_color(img: Image.Image, mode: str = "mean") -> str:
-    """
-    Extrae color de un recorte:
-    - mode='mean': color medio del recorte (más estable)
-    - mode='dominant': color dominante (cuantización simple)
-    """
-    arr = np.array(img.convert("RGB"))
-    if arr.size == 0:
-        return ""
-    if mode == "mean":
-        r, g, b = arr.reshape(-1, 3).mean(axis=0)
-        return hex_from_rgb((int(r), int(g), int(b)))
-    else:
-        # dominante por cuantización
-        small = Image.fromarray(arr).resize((64, 64))
-        q = small.quantize(colors=4, method=Image.MEDIANCUT)
-        pal = q.getpalette()[:12]
-        counts = q.getcolors() or []
-        if not counts:
-            return ""
-        counts.sort(reverse=True, key=lambda t: t[0])
-        _, idx = counts[0]
-        r, g, b = pal[idx*3: idx*3+3]
-        return hex_from_rgb((r, g, b))
-
-def detectar_color_secundario(img: Image.Image, n_colors: int = 3, min_dist: int = 24) -> tuple[str, bool]:
-    thumb = img.copy()
-    thumb.thumbnail((256, 256))
-    q = thumb.convert("RGB").quantize(colors=n_colors, method=Image.MEDIANCUT)
-    pal = q.getpalette()[:n_colors * 3]
-    counts = q.getcolors() or []
-    if not counts:
-        return "", False
-    counts.sort(reverse=True, key=lambda t: t[0])
-    _, idx0 = counts[0]
-    r0, g0, b0 = pal[idx0 * 3: idx0 * 3 + 3]
-    for _, idx in counts[1:]:
-        r, g, b = pal[idx * 3: idx * 3 + 3]
-        if abs(r - r0) + abs(g - g0) + abs(b - b0) >= min_dist:
-            return hex_from_rgb((r, g, b)), True
-    return "", False
-
-# ---------- UI ----------
-st.title("👕 Armario Digital")
-st.caption("Elige color por paleta, picker o **recortando una zona** de la imagen (el recorte hace de 'nueva foto' de un solo color).")
-
-with st.form("nueva_prenda", clear_on_submit=False):
-    c1, c2 = st.columns([1, 1])
-
-    with c1:
-        categoria = st.selectbox("Categoría", CATEGORIAS)
-        tipo = st.selectbox("Tipo (corto/largo)", TIPOS)
-
-        # --------- COLOR PRINCIPAL ----------
-        metodo1 = st.radio("Color principal — método", ["Paleta", "Picker", "Desde imagen (recorte)"])
-        color1_name, color1_hex = "", ""
-
-        if metodo1 == "Paleta":
-            color1_name = st.selectbox("Color (paleta)", list(PALETA.keys()), key="c1pal")
-            color1_hex = PALETA[color1_name]
-            color_preview(color1_hex)
-
-        elif metodo1 == "Picker":
-            color1_hex = st.color_picker("Color exacto", "#cccccc", key="c1pick")
-            color1_name = "Personalizado"
-            color_preview(color1_hex)
-
-        else:
-            foto1 = st.file_uploader("Fotografía para color principal (recórtala)", type=["png", "jpg", "jpeg"], key="foto1")
-            if foto1:
-                img1 = Image.open(io.BytesIO(foto1.getvalue()))
-                st.write("Arrastra el rectángulo sobre la zona cuyo color quieras capturar.")
-                cropped1 = st_cropper(img1, aspect_ratio=None, return_type="image", box_color="#00FF00", realtime_update=True, key="crop1")
-                # Puedes elegir entre media o dominante del recorte:
-                modo_color1 = st.radio("Cómo extraer el color del recorte", ["Media del recorte", "Dominante"], horizontal=True, key="c1mode")
-                color1_hex = dominant_or_mean_color(cropped1, mode="mean" if modo_color1 == "Media del recorte" else "dominant")
-                color1_name = "Desde recorte"
-                color_preview(color1_hex)
-                st.caption("El recorte actúa como 'nueva imagen' de la que extraemos el color.")
-            else:
-                st.info("Sube una foto para recortarla y extraer el color.")
-
-        # --------- COLOR SECUNDARIO ----------
-        st.markdown("---")
-        usar_color2 = st.checkbox("Añadir color secundario (opcional)")
-        color2_name, color2_hex, metodo2 = "", "", None
-        if usar_color2:
-            metodo2 = st.radio("Color secundario — método", ["Paleta", "Picker", "Desde imagen (recorte)"], key="m2")
-            if metodo2 == "Paleta":
-                color2_name = st.selectbox("Color secundario (paleta)", list(PALETA.keys()), key="c2pal")
-                color2_hex = PALETA[color2_name]
-                color_preview(color2_hex)
-            elif metodo2 == "Picker":
-                color2_hex = st.color_picker("Color secundario exacto", "#bbbbbb", key="c2pick")
-                color2_name = "Personalizado"
-                color_preview(color2_hex)
-            else:
-                foto2 = st.file_uploader("Fotografía para color secundario (recórtala)", type=["png", "jpg", "jpeg"], key="foto2")
-                if foto2:
-                    img2 = Image.open(io.BytesIO(foto2.getvalue()))
-                    st.write("Arrastra el rectángulo sobre la zona del color secundario.")
-                    cropped2 = st_cropper(img2, aspect_ratio=None, return_type="image", box_color="#00FF00", realtime_update=True, key="crop2")
-                    modo_color2 = st.radio("Cómo extraer el color del recorte", ["Media del recorte", "Dominante"], horizontal=True, key="c2mode")
-                    color2_hex = dominant_or_mean_color(cropped2, mode="mean" if modo_color2 == "Media del recorte" else "dominant")
-                    color2_name = "Desde recorte"
-                    color_preview(color2_hex)
-                else:
-                    st.info("Sube una foto para recortarla y extraer el color secundario.")
-
-        # --------- Botón: ¿Hay color secundario? ----------
-        st.markdown("---")
-        st.write("🔎 Detección automática de color secundario (opcional)")
-        foto_auto = st.file_uploader("Imagen para analizar", type=["png", "jpg", "jpeg"], key="foto_auto")
-        if st.button("¿Hay color secundario?"):
-            if not foto_auto:
-                st.warning("Sube una imagen para analizar.")
-            else:
-                img_auto = Image.open(io.BytesIO(foto_auto.getvalue()))
-                sugerido_hex, hay = detectar_color_secundario(img_auto)
-                if hay:
-                    st.success(f"Sí, parece haber un color secundario: **{sugerido_hex}**")
-                    color_preview(sugerido_hex)
-                else:
-                    st.info("No se detecta un color secundario claro.")
-
-    with c2:
-        foto_prenda = st.file_uploader("Fotografía de la prenda (opcional)", type=["png", "jpg", "jpeg"], key="fotoprenda")
-        if foto_prenda:
-            st.image(foto_prenda, caption="Vista previa", use_container_width=True)
-
-    enviado = st.form_submit_button("➕ Añadir prenda")
-    if enviado:
-        nueva = pd.DataFrame([{
-            "Categoria": categoria,
-            "Tipo": tipo,
-            "Color1Nombre": color1_name,
-            "Color1Hex": color1_hex,
-            "Color2Nombre": color2_name,
-            "Color2Hex": color2_hex,
-            "FotoBase64": file_to_b64(foto_prenda)
-        }], columns=COLUMNS)
-        st.session_state["armario"] = pd.concat([st.session_state["armario"], nueva], ignore_index=True)
-        st.success(f"{categoria} añadida ✅")
-
-# ---------- Exportar / Importar ----------
-st.subheader("💾 Guardar / Cargar tu armario (XML)")
-c1, c2 = st.columns(2)
-
-with c1:
+with col1:
     if not st.session_state["armario"].empty:
         xml_bytes = df_to_xml_bytes(st.session_state["armario"])
         fname = f"armario_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}Z.xml"
@@ -254,7 +380,7 @@ with c1:
     else:
         st.info("Añade prendas para poder descargar tu armario.")
 
-with c2:
+with col2:
     up = st.file_uploader("⬆️ Cargar XML", type=["xml"])
     modo = st.radio("Cómo cargar", ["Añadir a lo existente", "Reemplazar todo"], horizontal=True)
     if up is not None:
@@ -266,7 +392,7 @@ with c2:
                 st.session_state["armario"] = pd.concat([st.session_state["armario"], df_imp], ignore_index=True)
             st.success("XML cargado correctamente ✅")
 
-# ---------- Vista ----------
+# ---------------- Vista ----------------
 st.subheader("🗂 Tu Armario")
 if st.session_state["armario"].empty:
     st.info("Aún no has añadido ninguna prenda.")
@@ -293,6 +419,4 @@ else:
             img_bytes = b64_to_bytes(row["FotoBase64"])
             if img_bytes:
                 with cols[i % 6]:
-                    st.image(img_bytes, caption=f"{row['Categoria']} ({row['Color1Hex'] or row['Color1Nombre']})", use_container_width=True)
-
-st.caption("💡 Consejo: recorta una zona con el color que quieras y se calculará el color medio o dominante del recorte.")
+                    st.image(img_bytes, caption=f"{row['Categoria']} ({row['Color1Hex']}" + (f", {row['Color2Hex']}" if row['Color2Hex'] else "") + ")", use_container_width=True)
