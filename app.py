@@ -11,8 +11,8 @@ st.set_page_config(page_title="👕 Armario Digital", page_icon="🧥", layout="
 # ---------------- Config ----------------
 CATEGORIAS = ["Camiseta", "Camisa", "Sudadera", "Pantalón", "Short", "Falda", "Zapatillas", "Botas", "Sandalias"]
 TIPOS = ["Corto", "Largo"]
-COLUMNS = ["Categoria", "Tipo", "Color1Hex", "Color2Hex", "FotoBase64"]
-SCHEMA_VERSION = "12.1"
+COLUMNS = ["Categoria", "Tipo", "Color1Hex", "Color1Name", "Color2Hex", "Color2Name", "FotoBase64"]
+SCHEMA_VERSION = "13.0"
 
 PALETA = {
     "Negro": "#000000",
@@ -28,7 +28,6 @@ PALETA = {
     "Rosa": "#FFC0CB"
 }
 
-# Parámetros auto pensados para 1 prenda por foto
 AUTO_PARAMS = dict(
     center_keep=0.95,
     ignore_bg_mode="auto",
@@ -125,6 +124,7 @@ def quantize_colors(arr_rgb_uint8: np.ndarray, k=6):
     for count, idx in counts:
         r, g, b = pal[idx*3:idx*3+3]
         res.append((int(count), (int(r), int(g), int(b))))
+        # Nota: la paleta puede repetir si k > colores reales, pero ordenamos por count
     res.sort(key=lambda t: t[0], reverse=True)
     return res
 
@@ -223,20 +223,21 @@ def auto_colors_from_image(image: Image.Image, params: dict):
         {"pixels_used": int(selected.shape[0]), "border_samples": [hex_from_rgb(c) for c in border_rgbs], "palette": palette_hex}
     )
 
-def swatch(hex_code, label=None):
-    if not hex_code:
-        return
-    lab = f"&nbsp;{label}" if label else ""
-    st.markdown(
-        f"<div style='display:flex;align-items:center;gap:8px;'>"
-        f"<div style='width:28px;height:28px;border-radius:6px;border:1px solid #000;background:{hex_code};'></div>"
-        f"<code>{hex_code}</code>{lab}"
-        f"</div>", unsafe_allow_html=True
-    )
+def swatch_with_label(hex_code, title):
+    st.markdown(f"**{title}**")
+    if hex_code:
+        st.markdown(
+            f"<div style='display:flex;align-items:center;gap:8px;'>"
+            f"<div style='width:28px;height:28px;border-radius:6px;border:1px solid #000;background:{hex_code};'></div>"
+            f"<code>{hex_code}</code>"
+            f"</div>", unsafe_allow_html=True
+        )
+    else:
+        st.info("—")
 
 # ---------------- UI: Crear prenda ----------------
 st.title("👕 Armario Digital — Un método para principal y secundario")
-st.caption("Elige Paleta / Hex / Automático. Si marcas color secundario, se usa el mismo método. Foto obligatoria solo en Automático (y es la misma que se guarda).")
+st.caption("Si hay secundario, se usa el mismo método. En Automático la foto es obligatoria y se reutiliza para guardar.")
 
 with st.form("nueva_prenda", clear_on_submit=False):
     left, right = st.columns([1, 1])
@@ -246,7 +247,7 @@ with st.form("nueva_prenda", clear_on_submit=False):
         tipo = st.selectbox("Tipo", TIPOS)
 
         metodo = st.radio(
-            "Método de color (se aplica a principal y secundario):",
+            "Método de color (aplica a principal y secundario):",
             ["Paleta", "Hex (picker)", "Automático desde imagen"],
             index=0
         )
@@ -260,70 +261,152 @@ with st.form("nueva_prenda", clear_on_submit=False):
         if foto_prenda:
             st.image(foto_prenda, caption="Vista previa (esta misma se usa para detectar si toca)", use_container_width=True)
 
-    # Selección de colores según método (unificado)
-    color1_hex = ""
-    color2_hex = ""
+    # Valores a guardar
+    color1_hex, color2_hex = "", ""
+    color1_name, color2_name = "", ""
 
+    # --- Método Paleta ---
     if metodo == "Paleta":
         col1, col2 = st.columns(2)
         with col1:
-            nombre_p = st.selectbox("Color principal (paleta)", list(PALETA.keys()), key="paleta_p")
-            color1_hex = PALETA[nombre_p]
-            swatch(color1_hex, "(paleta)")
+            n1 = st.selectbox("Color principal (paleta)", list(PALETA.keys()), key="paleta_p")
+            color1_hex = PALETA[n1]
+            swatch_with_label(color1_hex, "Principal")
         if hay_secundario:
             with col2:
-                nombre_s = st.selectbox("Color secundario (paleta)", list(PALETA.keys()), key="paleta_s")
-                color2_hex = PALETA[nombre_s]
-                swatch(color2_hex, "(paleta)")
+                n2 = st.selectbox("Color secundario (paleta)", list(PALETA.keys()), key="paleta_s")
+                color2_hex = PALETA[n2]
+                swatch_with_label(color2_hex, "Secundario")
+        # Nombres opcionales
+        st.markdown("**Nombres (opcionales)**")
+        c1, c2 = st.columns(2)
+        with c1:
+            color1_name = st.text_input("Nombre para principal", value="")
+        if hay_secundario:
+            with c2:
+                color2_name = st.text_input("Nombre para secundario", value="")
 
+    # --- Método Hex ---
     elif metodo == "Hex (picker)":
         col1, col2 = st.columns(2)
         with col1:
             color1_hex = st.color_picker("Color principal (hex)", "#cccccc", key="hex_p")
-            swatch(color1_hex, "(hex)")
+            swatch_with_label(color1_hex, "Principal")
         if hay_secundario:
             with col2:
                 color2_hex = st.color_picker("Color secundario (hex)", "#bbbbbb", key="hex_s")
-                swatch(color2_hex, "(hex)")
+                swatch_with_label(color2_hex, "Secundario")
+        # Nombres opcionales
+        st.markdown("**Nombres (opcionales)**")
+        c1, c2 = st.columns(2)
+        with c1:
+            color1_name = st.text_input("Nombre para principal", value="")
+        if hay_secundario:
+            with c2:
+                color2_name = st.text_input("Nombre para secundario", value="")
 
-    else:  # Automático desde imagen
+    # --- Método Automático ---
+    else:
         if not foto_prenda:
             st.warning("El método 'Automático desde imagen' requiere subir la foto de la prenda.")
         else:
             img = Image.open(io.BytesIO(foto_prenda.getvalue())).convert("RGB")
             c1_auto, c2_auto, meta = auto_colors_from_image(img, AUTO_PARAMS)
-            if c1_auto:
-                color1_hex = c1_auto
-                swatch(color1_hex, "(auto)")
-            else:
-                st.info("No se pudo detectar color principal.")
-            if hay_secundario:
-                if c2_auto and (not c1_auto or c2_auto.lower() != c1_auto.lower()):
-                    color2_hex = c2_auto
-                    swatch(color2_hex, "(auto)")
-                else:
-                    # Si el detector no encontró un secundario distinto, lo tratamos como monocolor
-                    color2_hex = ""
-                    st.info("No se detecta un color secundario distinto; se guarda como prenda monocolor.")
 
-    # --- Enforce distinct colors (regla global) ---
-    if hay_secundario and color1_hex and color2_hex:
-        if color1_hex.lower() == color2_hex.lower():
-            if metodo in ["Paleta", "Hex (picker)"]:
-                st.error("El color secundario debe ser distinto del principal. Cambia uno de los dos.")
+            # Caso 1: detecta ambos
+            if c1_auto and c2_auto and c1_auto.lower() != c2_auto.lower():
+                color1_hex, color2_hex = c1_auto, c2_auto
+
+                st.markdown("### 🎯 Detección automática")
+                cA, cB = st.columns(2)
+                with cA: swatch_with_label(color1_hex, "Principal (auto)")
+                with cB: swatch_with_label(color2_hex, "Secundario (auto)")
+
+                ok = st.radio("¿Se ha detectado correctamente?", ["Sí", "No"], index=0, horizontal=True)
+                if ok == "Sí":
+                    st.markdown("**Nombres (opcionales)**")
+                    c1c, c2c = st.columns(2)
+                    with c1c:
+                        color1_name = st.text_input("Nombre para principal", value="")
+                    if hay_secundario:
+                        with c2c:
+                            color2_name = st.text_input("Nombre para secundario", value="")
+                else:
+                    st.info("Corrige los colores con HEX:")
+                    colx, coly = st.columns(2)
+                    with colx:
+                        color1_hex = st.color_picker("Principal (HEX)", color1_hex, key="auto_fix_p")
+                        swatch_with_label(color1_hex, "Principal (ajustado)")
+                    with coly:
+                        if hay_secundario:
+                            color2_hex = st.color_picker("Secundario (HEX)", color2_hex, key="auto_fix_s")
+                            swatch_with_label(color2_hex, "Secundario (ajustado)")
+
+            # Caso 2: detecta solo principal
+            elif c1_auto and (not c2_auto or c1_auto.lower() == (c2_auto or "").lower()):
+                color1_hex = c1_auto
+                st.markdown("### 🎯 Detección automática")
+                swatch_with_label(color1_hex, "Principal (auto)")
+
+                if hay_secundario:
+                    st.warning("No se ha detectado un secundario distinto.")
+                    mcol = st.radio(
+                        "¿Cómo quieres proceder?",
+                        ["Añadir secundario manual (HEX)", "El detectado como principal es el SECUNDARIO; definir PRINCIPAL en HEX"],
+                        index=0
+                    )
+                    if mcol == "Añadir secundario manual (HEX)":
+                        color2_hex = st.color_picker("Secundario (HEX)", "#bbbbbb", key="auto_add_sec")
+                        swatch_with_label(color2_hex, "Secundario (manual)")
+                    else:
+                        # swap: el auto pasa a ser secundario; defines principal
+                        color2_hex = color1_hex
+                        color1_hex = st.color_picker("Principal (HEX)", "#cccccc", key="auto_swap_prin")
+                        cA, cB = st.columns(2)
+                        with cA: swatch_with_label(color1_hex, "Principal (definido)")
+                        with cB: swatch_with_label(color2_hex, "Secundario (auto)")
+
+                # Nombres opcionales
+                st.markdown("**Nombres (opcionales)**")
+                c1c, c2c = st.columns(2)
+                with c1c:
+                    color1_name = st.text_input("Nombre para principal", value="")
+                if hay_secundario:
+                    with c2c:
+                        color2_name = st.text_input("Nombre para secundario", value="")
+
+            # Caso 3: no detecta nada útil
             else:
-                # En automático, si llega a ser igual, lo vaciamos y avisamos
-                color2_hex = ""
-                st.info("Secundario igual al principal; se guarda como monocolor.")
+                st.info("No se pudo detectar colores. Define por HEX:")
+                colx, coly = st.columns(2)
+                with colx:
+                    color1_hex = st.color_picker("Principal (HEX)", "#cccccc", key="auto_fail_p")
+                    swatch_with_label(color1_hex, "Principal")
+                if hay_secundario:
+                    with coly:
+                        color2_hex = st.color_picker("Secundario (HEX)", "#bbbbbb", key="auto_fail_s")
+                        swatch_with_label(color2_hex, "Secundario")
+
+                st.markdown("**Nombres (opcionales)**")
+                c1c, c2c = st.columns(2)
+                with c1c:
+                    color1_name = st.text_input("Nombre para principal", value="")
+                if hay_secundario:
+                    with c2c:
+                        color2_name = st.text_input("Nombre para secundario", value="")
+
+    # --- Regla global: si hay secundario, debe ser distinto del principal ---
+    if hay_secundario and color1_hex and color2_hex and color1_hex.lower() == color2_hex.lower():
+        st.error("El color secundario debe ser distinto del principal. Cambia uno de los dos.")
 
     # Validaciones
     errores = []
     if metodo == "Automático desde imagen" and not foto_prenda:
         errores.append("Debes subir la foto de la prenda para usar el método Automático.")
-    if metodo in ["Paleta", "Hex (picker)"] and not color1_hex:
-        errores.append("Selecciona el color principal.")
-    if hay_secundario and metodo in ["Paleta", "Hex (picker)"] and not color2_hex:
-        errores.append("Has indicado color secundario: selecciónalo con el mismo método.")
+    if not color1_hex:
+        errores.append("Selecciona o define el color principal.")
+    if hay_secundario and not color2_hex:
+        errores.append("Has indicado color secundario: defínelo con el mismo método.")
     if hay_secundario and color1_hex and color2_hex and color1_hex.lower() == color2_hex.lower():
         errores.append("El color secundario debe ser distinto del principal.")
 
@@ -337,8 +420,10 @@ with st.form("nueva_prenda", clear_on_submit=False):
                 "Categoria": categoria,
                 "Tipo": tipo,
                 "Color1Hex": color1_hex or "",
-                "Color2Hex": color2_hex or "",
-                "FotoBase64": file_to_b64(foto_prenda)  # misma imagen (opcional salvo en auto, donde es obligatoria)
+                "Color1Name": color1_name or "",
+                "Color2Hex": color2_hex if hay_secundario else "",
+                "Color2Name": color2_name if hay_secundario else "",
+                "FotoBase64": file_to_b64(foto_prenda)
             }], columns=COLUMNS)
             st.session_state["armario"] = pd.concat([st.session_state["armario"], nueva], ignore_index=True)
             st.success(f"{categoria} añadida ✅")
@@ -354,7 +439,9 @@ def df_to_xml_bytes(df: pd.DataFrame) -> bytes:
         SubElement(item, "category").text = str(row["Categoria"])
         SubElement(item, "type").text = str(row["Tipo"])
         SubElement(item, "color1_hex").text = str(row.get("Color1Hex",""))
+        SubElement(item, "color1_name").text = str(row.get("Color1Name",""))
         SubElement(item, "color2_hex").text = str(row.get("Color2Hex",""))
+        SubElement(item, "color2_name").text = str(row.get("Color2Name",""))
         if row.get("FotoBase64"):
             SubElement(item, "photo_b64").text = row["FotoBase64"]
     buf = io.BytesIO()
@@ -370,7 +457,9 @@ def xml_bytes_to_df(xml_bytes: bytes) -> pd.DataFrame:
                 "Categoria": item.findtext("category",""),
                 "Tipo": item.findtext("type",""),
                 "Color1Hex": item.findtext("color1_hex",""),
+                "Color1Name": item.findtext("color1_name",""),
                 "Color2Hex": item.findtext("color2_hex",""),
+                "Color2Name": item.findtext("color2_name",""),
                 "FotoBase64": item.findtext("photo_b64","") or "",
             })
         return pd.DataFrame(rows, columns=COLUMNS)
@@ -417,7 +506,6 @@ else:
 
     st.dataframe(df.drop(columns=["FotoBase64"]), use_container_width=True)
 
-    # Miniaturas
     thumbs = df[df["FotoBase64"].str.len() > 0]
     if not thumbs.empty:
         st.write("### 📸 Miniaturas")
