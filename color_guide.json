@@ -1,0 +1,19 @@
+{
+  "families": ["neutral","black","white","gray","beige","brown","red","orange","yellow","green","cyan","blue","purple","pink"],
+  "compatibility": {
+    "neutral": ["red","orange","yellow","green","cyan","blue","purple","pink","brown","beige","gray","black","white"],
+    "black":    ["red","orange","yellow","green","cyan","blue","purple","pink","beige","gray","white"],
+    "white":    ["red","orange","yellow","green","cyan","blue","purple","pink","brown","beige","gray","black"],
+    "gray":     ["red","orange","yellow","green","cyan","blue","purple","pink","brown","beige","black","white"],
+    "beige":    ["brown","white","black","green","blue","pink","red"],
+    "brown":    ["beige","green","blue","white","pink"],
+    "red":      ["neutral","white","black","gray","beige","blue","green","pink"],
+    "orange":   ["neutral","white","black","gray","blue","green","brown"],
+    "yellow":   ["neutral","white","black","gray","blue","green","brown"],
+    "green":    ["neutral","white","black","gray","beige","brown","blue","red","yellow"],
+    "cyan":     ["neutral","white","black","gray","blue","purple"],
+    "blue":     ["neutral","white","black","gray","beige","brown","green","red","yellow","pink"],
+    "purple":   ["neutral","white","black","gray","pink","yellow","green"],
+    "pink":     ["neutral","white","black","gray","blue","red","beige"]
+  }
+}
