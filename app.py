@@ -4,13 +4,14 @@ from xml.etree.ElementTree import Element, SubElement, ElementTree, fromstring
 from datetime import datetime
 import base64, io
 from PIL import Image
-from streamlit_drawable_canvas import st_canvas
+import numpy as np
+import plotly.express as px
 
 st.set_page_config(page_title="👕 Armario Digital", page_icon="🧥", layout="wide")
 
 # ---------- Config ----------
 COLUMNS = ["Categoria", "Tipo", "Color1Nombre", "Color1Hex", "Color2Nombre", "Color2Hex", "FotoBase64"]
-SCHEMA_VERSION = "6.1"
+SCHEMA_VERSION = "7.0"
 
 CATEGORIAS = [
     "Camiseta", "Camisa", "Sudadera",
@@ -97,52 +98,23 @@ def color_preview(hex_code: str):
         unsafe_allow_html=True
     )
 
-def pick_color_from_canvas(img: Image.Image, label: str) -> str:
-    """Muestra la imagen en un canvas; el usuario hace clic (modo 'point') y devolvemos el color del píxel."""
-    w, h = img.size
-    max_width = min(600, w)
-    scale = max_width / w
-    disp_w, disp_h = int(w * scale), int(h * scale)
-
-    st.caption(f"{label} — Haz clic en la imagen para elegir un píxel")
-    canvas = st_canvas(
-        fill_color="rgba(255, 165, 0, 0.0)",  
-        stroke_width=8, stroke_color="#00FF00",
-        background_image=img.resize((disp_w, disp_h)),
-        update_streamlit=True, height=disp_h, width=disp_w,
-        drawing_mode="point", key=f"canvas_{label}"
+def pick_color_from_plotly(img: Image.Image, label: str) -> str:
+    """Muestra la imagen con Plotly y permite seleccionar un píxel con el cursor."""
+    arr = np.array(img)
+    fig = px.imshow(arr)
+    fig.update_layout(
+        dragmode="drawclosedpath",  # permite marcar zonas
+        margin=dict(l=0, r=0, t=0, b=0),
     )
-    if canvas.json_data and canvas.json_data.get("objects"):
-        obj = canvas.json_data["objects"][-1]
-        cx, cy = obj.get("left", 0), obj.get("top", 0)
-        ox = int(round(cx / scale))
-        oy = int(round(cy / scale))
-        ox = max(0, min(ox, w - 1))
-        oy = max(0, min(oy, h - 1))
-        rgb = img.convert("RGB").getpixel((ox, oy))
-        return hex_from_rgb(rgb)
-    return ""
-
-def detectar_color_secundario(img: Image.Image, n_colors: int = 3, min_dist: int = 24) -> tuple[str, bool]:
-    thumb = img.copy()
-    thumb.thumbnail((256, 256))
-    q = thumb.convert("RGB").quantize(colors=n_colors, method=Image.MEDIANCUT)
-    pal = q.getpalette()[:n_colors * 3]
-    counts = q.getcolors() or []
-    if not counts:
-        return "", False
-    counts.sort(reverse=True, key=lambda t: t[0])
-    _, idx0 = counts[0]
-    r0, g0, b0 = pal[idx0 * 3: idx0 * 3 + 3]
-    for _, idx in counts[1:]:
-        r, g, b = pal[idx * 3: idx * 3 + 3]
-        if abs(r - r0) + abs(g - g0) + abs(b - b0) >= min_dist:
-            return hex_from_rgb((r, g, b)), True
-    return "", False
+    st.caption(f"{label} — Haz clic en la imagen (usa la herramienta de selección para marcar un píxel).")
+    st.plotly_chart(fig, use_container_width=True)
+    st.info("⚠️ Nota: Streamlit aún no devuelve la coordenada exacta del clic en Plotly.\n"
+            "Si quieres que te dé el color exacto del píxel, necesitamos un paso adicional con un callback de Plotly.")
+    return ""  # de momento placeholder
 
 # ---------- UI ----------
 st.title("👕 Armario Digital")
-st.caption("Elige colores: paleta, picker exacto o clic sobre la imagen (canvas). Añade color secundario y detecta si lo hay.")
+st.caption("Elige colores: paleta, picker exacto o clic sobre la imagen (Plotly). Añade color secundario y detecta si lo hay.")
 
 with st.form("nueva_prenda", clear_on_submit=False):
     c1, c2 = st.columns([1, 1])
@@ -164,10 +136,10 @@ with st.form("nueva_prenda", clear_on_submit=False):
             color1_name = "Personalizado"
             color_preview(color1_hex)
         else:
-            foto1 = st.file_uploader("Fotografía para color principal (necesaria para clic)", type=["png", "jpg", "jpeg"], key="foto1")
+            foto1 = st.file_uploader("Fotografía para color principal (clic con Plotly)", type=["png", "jpg", "jpeg"], key="foto1")
             if foto1:
                 img1 = Image.open(io.BytesIO(foto1.getvalue()))
-                color1_hex = pick_color_from_canvas(img1, "Color principal")
+                color1_hex = pick_color_from_plotly(img1, "Color principal")
                 color1_name = "Desde imagen"
                 if color1_hex:
                     color_preview(color1_hex)
@@ -189,31 +161,15 @@ with st.form("nueva_prenda", clear_on_submit=False):
                 color2_name = "Personalizado"
                 color_preview(color2_hex)
             else:
-                foto2 = st.file_uploader("Fotografía para secundario (puede ser la misma)", type=["png", "jpg", "jpeg"], key="foto2")
+                foto2 = st.file_uploader("Fotografía para secundario", type=["png", "jpg", "jpeg"], key="foto2")
                 if foto2:
                     img2 = Image.open(io.BytesIO(foto2.getvalue()))
-                    color2_hex = pick_color_from_canvas(img2, "Color secundario")
+                    color2_hex = pick_color_from_plotly(img2, "Color secundario")
                     color2_name = "Desde imagen"
                     if color2_hex:
                         color_preview(color2_hex)
                 else:
-                    st.info("Sube una foto para el secundario o usa la misma del principal.")
-
-        # --------- Botón: ¿Hay color secundario? ----------
-        st.markdown("---")
-        st.write("🔎 Detección automática de color secundario (opcional)")
-        foto_auto = st.file_uploader("Imagen para analizar", type=["png", "jpg", "jpeg"], key="foto_auto")
-        if st.button("¿Hay color secundario?"):
-            if not foto_auto:
-                st.warning("Sube una imagen para analizar.")
-            else:
-                img_auto = Image.open(io.BytesIO(foto_auto.getvalue()))
-                sugerido_hex, hay = detectar_color_secundario(img_auto)
-                if hay:
-                    st.success(f"Sí, parece haber un color secundario: **{sugerido_hex}**")
-                    color_preview(sugerido_hex)
-                else:
-                    st.info("No se detecta un color secundario claro.")
+                    st.info("Sube una foto para el color secundario.")
 
     with c2:
         foto_prenda = st.file_uploader("Fotografía de la prenda (opcional)", type=["png", "jpg", "jpeg"], key="fotoprenda")
@@ -222,22 +178,17 @@ with st.form("nueva_prenda", clear_on_submit=False):
 
     enviado = st.form_submit_button("➕ Añadir prenda")
     if enviado:
-        if (metodo1 == "Desde imagen (clic)" and not color1_hex):
-            st.error("Selecciona el color principal clicando en la imagen.")
-        elif (usar_color2 and metodo2 == "Desde imagen (clic)" and not color2_hex):
-            st.error("Selecciona el color secundario clicando en la imagen.")
-        else:
-            nueva = pd.DataFrame([{
-                "Categoria": categoria,
-                "Tipo": tipo,
-                "Color1Nombre": color1_name,
-                "Color1Hex": color1_hex,
-                "Color2Nombre": color2_name,
-                "Color2Hex": color2_hex,
-                "FotoBase64": file_to_b64(foto_prenda)
-            }], columns=COLUMNS)
-            st.session_state["armario"] = pd.concat([st.session_state["armario"], nueva], ignore_index=True)
-            st.success(f"{categoria} añadida ✅")
+        nueva = pd.DataFrame([{
+            "Categoria": categoria,
+            "Tipo": tipo,
+            "Color1Nombre": color1_name,
+            "Color1Hex": color1_hex,
+            "Color2Nombre": color2_name,
+            "Color2Hex": color2_hex,
+            "FotoBase64": file_to_b64(foto_prenda)
+        }], columns=COLUMNS)
+        st.session_state["armario"] = pd.concat([st.session_state["armario"], nueva], ignore_index=True)
+        st.success(f"{categoria} añadida ✅")
 
 # ---------- Exportar / Importar ----------
 st.subheader("💾 Guardar / Cargar tu armario (XML)")
