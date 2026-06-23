@@ -1,5 +1,0 @@
-streamlit
-supabase
-pandas
-pillow
-numpy
